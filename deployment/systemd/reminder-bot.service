@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Reminder Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/telegram_reminder_mvp
+EnvironmentFile=/opt/telegram_reminder_mvp/.env
+ExecStart=/opt/telegram_reminder_mvp/.venv/bin/python -m app.main
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
