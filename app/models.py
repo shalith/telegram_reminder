@@ -157,3 +157,43 @@ class EvalCase(Base):
     expected_action: Mapped[str] = mapped_column(String(64))
     expected_json: Mapped[str | None] = mapped_column(Text(), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class InteractionFeedback(Base):
+    __tablename__ = "interaction_feedback"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now(), index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    message_text: Mapped[str] = mapped_column(Text())
+    phase: Mapped[str] = mapped_column(String(64), index=True)
+    outcome: Mapped[str] = mapped_column(String(32), index=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    details_json: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+
+class CorrectionExample(Base):
+    __tablename__ = "correction_examples"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now(), index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    source_text: Mapped[str] = mapped_column(Text())
+    action_name: Mapped[str] = mapped_column(String(64), index=True)
+    resolved_task: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    resolved_time_phrase: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    learned_from_follow_up: Mapped[bool] = mapped_column(Boolean, default=False)
+    notes: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+
+class LearnedTimePattern(Base):
+    __tablename__ = "learned_time_patterns"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_phrase: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    normalized_phrase: Mapped[str] = mapped_column(String(255))
+    success_count: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now(), onupdate=func.now())

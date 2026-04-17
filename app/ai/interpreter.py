@@ -46,6 +46,7 @@ class StructuredInterpreter:
         pending_state: PendingConversationState | None,
         open_reminders: list[Reminder],
         preference_snapshot: str,
+        learned_examples: list[str] | None = None,
     ) -> InterpreterResult:
         fallback_envelope = self._fallback_envelope(message_text=message_text, pending_state=pending_state)
         if self.client is None:
@@ -58,6 +59,7 @@ class StructuredInterpreter:
                 preference_snapshot=preference_snapshot,
                 recent_reminders=reminder_lines,
                 pending_state=pending_state,
+                learned_examples=learned_examples,
             )
             user_prompt = build_user_prompt(message_text)
             schema = get_interpretation_schema()

@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import dateparser
 
+from app.ai.time_normalizer import looks_like_time_phrase, normalize_time_phrase
 from app.models import RecurrenceType
 from app.recurrence import compute_next_occurrence_utc
 
@@ -38,6 +39,12 @@ WEEKDAY_NAME_TO_INT = {
     "saturday": 5,
     "sunday": 6,
 }
+WEEKDAY_NAME_RE = r"monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+MONTH_NAME_RE = r"jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december"
+TIME_ANCHOR_RE = re.compile(
+    rf"\b(today|tomorrow|tonight|next\s+(?:{WEEKDAY_NAME_RE})|this\s+(?:{WEEKDAY_NAME_RE})|every\s+(?:day|weekday|{WEEKDAY_NAME_RE})|in\s+\d+\s+(?:minutes?|hours?|days?)|(?:\d{{1,2}})(?:st|nd|rd|th)?\s+(?:{MONTH_NAME_RE})(?:\s+\d{{4}})?|morning|afternoon|evening|night|\d{{1,2}}(?::\d{{2}})?\s*(?:am|pm))\b",
+    re.IGNORECASE,
+)
 
 
 def parse_reminder_text(text: str, timezone_name: str) -> ParseResult:
@@ -64,24 +71,22 @@ def parse_reminder_text(text: str, timezone_name: str) -> ParseResult:
 
     if REMIND_ME_PREFIX.match(normalized):
         remainder = REMIND_ME_PREFIX.sub("", normalized, count=1).strip()
-        split_index = remainder.lower().rfind(" to ")
-        if split_index == -1:
+        task, time_phrase = split_task_and_time_phrase(remainder)
+        if not task and not time_phrase:
             return ParseResult(
                 ok=False,
                 error=(
                     "Use one of these formats:\n"
                     "• Remind me tomorrow at 7 PM to pay rent\n"
+                    "• Remind me to pay rent today morning 9am\n"
                     "• Remind me every day at 8 AM to check my tasks\n"
                     "• Wake me up at 6 AM tomorrow"
                 ),
             )
-
-        time_phrase = remainder[:split_index].strip()
-        task = remainder[split_index + 4 :].strip(" .")
-        if not time_phrase:
-            return ParseResult(ok=False, error="I need a time for that reminder.")
         if not task:
             return ParseResult(ok=False, error="I need the task to remind you about.")
+        if not time_phrase:
+            return ParseResult(ok=False, error="I need a time for that reminder.")
         return parse_schedule_components(task=task, time_phrase=time_phrase, timezone_name=timezone_name)
 
     return ParseResult(
@@ -89,12 +94,63 @@ def parse_reminder_text(text: str, timezone_name: str) -> ParseResult:
         error=(
             "I support these reminder formats right now:\n"
             "• Remind me tomorrow at 7 PM to pay rent\n"
+            "• Remind me to pay rent today morning 9am\n"
             "• Remind me every day at 8 AM to check my tasks\n"
             "• Remind me every Monday at 9 AM to submit the report\n"
             "• Wake me up at 6 AM tomorrow\n"
             "• Wake me up every weekday at 6 AM"
         ),
     )
+
+
+def split_task_and_time_phrase(remainder: str) -> tuple[str | None, str | None]:
+    value = " ".join((remainder or "").strip().split())
+    if not value:
+        return None, None
+
+    # Classic: <time> to <task>
+    split_index = value.lower().rfind(" to ")
+    if split_index != -1:
+        time_phrase = value[:split_index].strip()
+        task = value[split_index + 4 :].strip(" .")
+        if time_phrase and task:
+            return task, time_phrase
+
+    # Task-first with explicit "to"
+    match = re.match(r"^to\s+(.+?)\s+(today|tomorrow|tonight|next\s+\w+|this\s+\w+|in\s+\d+\s+\w+|every\s+.+|\d{1,2}(?:st|nd|rd|th)?\s+\w+.+)$", value, re.IGNORECASE)
+    if match and looks_like_time_phrase(match.group(2)):
+        return match.group(1).strip(" ."), match.group(2).strip()
+
+    # Task-first with "at"
+    match = re.match(r"^(?:to\s+)?(.+?)\s+at\s+(.+)$", value, re.IGNORECASE)
+    if match and looks_like_time_phrase(match.group(2)):
+        return match.group(1).strip(" ."), match.group(2).strip()
+
+    # Task-first with a trailing time anchor without "at"
+    anchor_match = None
+    for found in TIME_ANCHOR_RE.finditer(value):
+        anchor_match = found
+        break
+    if anchor_match is not None and anchor_match.start() > 0:
+        task = value[: anchor_match.start()].strip(" .,")
+        time_phrase = value[anchor_match.start() :].strip(" .,")
+        if task and looks_like_time_phrase(time_phrase):
+            return cleanup_task_prefix(task), time_phrase
+
+    # about <task> <time>
+    match = re.match(r"^about\s+(.+?)\s+(today|tomorrow|tonight|next\s+\w+|this\s+\w+|in\s+\d+\s+\w+|every\s+.+|\d{1,2}(?:st|nd|rd|th)?\s+\w+.+)$", value, re.IGNORECASE)
+    if match and looks_like_time_phrase(match.group(2)):
+        return match.group(1).strip(" ."), match.group(2).strip()
+
+    if looks_like_time_phrase(value):
+        return None, value
+    return value.strip(" ."), None
+
+
+def cleanup_task_prefix(task: str) -> str:
+    cleaned = task.strip(" .")
+    cleaned = re.sub(r"^(to|about)\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip(" .")
 
 
 def parse_schedule_components(
@@ -106,11 +162,13 @@ def parse_schedule_components(
     retry_interval_minutes: int = 2,
     max_attempts: int = 10,
 ) -> ParseResult:
-    task = task.strip(" .")
+    task = cleanup_task_prefix(task)
     if not task:
         return ParseResult(ok=False, error="I need the task to remind you about.")
 
-    recurrence_bits = parse_recurrence_phrase(time_phrase, timezone_name)
+    normalized_time_phrase = normalize_time_phrase(time_phrase)
+
+    recurrence_bits = parse_recurrence_phrase(normalized_time_phrase, timezone_name)
     if recurrence_bits is not None:
         return ParseResult(
             ok=True,
@@ -121,13 +179,15 @@ def parse_schedule_components(
             **recurrence_bits,
         )
 
-    when_utc = parse_datetime_phrase(time_phrase, timezone_name)
+    when_utc = parse_datetime_phrase(normalized_time_phrase, timezone_name)
     if when_utc is None:
         return ParseResult(
             ok=False,
             error=(
                 "I couldn't understand that time. Try something like:\n"
                 "• tomorrow at 7 PM\n"
+                "• today morning 9\n"
+                "• 18th Apr morning 8\n"
                 "• next Monday at 9 AM\n"
                 "• every weekday at 6 AM"
             ),
@@ -148,7 +208,7 @@ def parse_schedule_components(
 
 
 def parse_recurrence_phrase(time_phrase: str, timezone_name: str) -> dict[str, object] | None:
-    normalized = " ".join(time_phrase.strip().split()).lower()
+    normalized = normalize_time_phrase(" ".join(time_phrase.strip().split())).lower()
 
     match = re.match(r"^(?:every day|daily) at (.+)$", normalized, re.IGNORECASE)
     if match:
@@ -213,13 +273,14 @@ def build_recurrence_result(
 
 
 def parse_datetime_phrase(time_phrase: str, timezone_name: str) -> datetime | None:
+    normalized = normalize_time_phrase(time_phrase)
     settings = {
         "PREFER_DATES_FROM": "future",
         "TIMEZONE": timezone_name,
         "RETURN_AS_TIMEZONE_AWARE": True,
         "PREFER_DAY_OF_MONTH": "first",
     }
-    parsed = dateparser.parse(time_phrase, settings=settings)
+    parsed = dateparser.parse(normalized, settings=settings)
     if parsed is None:
         return None
 
@@ -232,8 +293,9 @@ def parse_datetime_phrase(time_phrase: str, timezone_name: str) -> datetime | No
 
 def parse_time_fragment(time_fragment: str, timezone_name: str) -> tuple[int, int] | None:
     now = datetime.now(ZoneInfo(timezone_name))
+    normalized = normalize_time_phrase(time_fragment)
     parsed = dateparser.parse(
-        time_fragment,
+        normalized,
         settings={
             "TIMEZONE": timezone_name,
             "RETURN_AS_TIMEZONE_AWARE": True,

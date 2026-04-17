@@ -9,8 +9,11 @@ from telegram import InlineKeyboardMarkup
 from app.ai.checker import InterpretationChecker
 from app.ai.interpreter import StructuredInterpreter
 from app.ai.schemas import FollowUp, InterpretationEnvelope, PendingConversationState
+from app.ai.time_normalizer import looks_like_time_phrase, normalize_time_phrase
 from app.config import Settings
+from app.learning import EvalBuilder, ExampleMemoryStore, FeedbackStore, RuleSuggester
 from app.models import ConversationState
+from app.parser import split_task_and_time_phrase
 from app.repositories.ai_run_repo import AiRunRepository
 from app.service import ReminderService
 from app.services.audit_service import AuditService
@@ -44,6 +47,10 @@ class InterpretationService:
         self.ai_run_repo = AiRunRepository()
         self.target_resolution = TargetResolutionService()
         self.duplicates = DuplicateDetectionService()
+        self.feedback = FeedbackStore()
+        self.example_memory = ExampleMemoryStore()
+        self.eval_builder = EvalBuilder()
+        self.rule_suggester = RuleSuggester()
         self.create_tool = CreateReminderTool(self.reminder_service)
         self.list_tool = ListRemindersTool(self.reminder_service)
         self.update_tool = UpdateReminderTool(self.reminder_service)
@@ -62,12 +69,16 @@ class InterpretationService:
         )
         open_reminders = self.reminder_service.list_open_reminders(session, chat_id=chat_id)
         pending_state = self._get_pending_state(session, chat_id=chat_id)
+        learned_examples = self.example_memory.format_for_prompt(
+            self.example_memory.find_similar(session, telegram_user_id=telegram_user_id, message_text=message_text)
+        )
         interpreter_result = self.interpreter.interpret(
             message_text=message_text,
             timezone_name=pref.timezone,
             pending_state=pending_state,
             open_reminders=open_reminders,
             preference_snapshot=self.reminder_service.format_preferences_summary(pref),
+            learned_examples=learned_examples,
         )
         envelope = interpreter_result.envelope
         if pending_state is not None and envelope.action == "clarify":
@@ -79,7 +90,7 @@ class InterpretationService:
             user_id=telegram_user_id,
             chat_id=chat_id,
             message_text=message_text,
-            system_prompt_version="phase6_v1",
+            system_prompt_version="phase6_1_6_2_v1",
             model_name=interpreter_result.model_name,
             raw_response_text=interpreter_result.raw_response_text,
             parsed_json=envelope.model_dump_json(),
@@ -93,6 +104,7 @@ class InterpretationService:
 
         if checker_result.follow_up_text or envelope.follow_up.needed:
             follow_up_text = checker_result.follow_up_text or envelope.follow_up.question or "I need a bit more information."
+            source_message = pending_state.source_message_text if pending_state and pending_state.source_message_text else message_text
             pending = PendingConversationState(
                 action=envelope.action,
                 reminder=envelope.reminder,
@@ -105,6 +117,8 @@ class InterpretationService:
                 ),
                 user_message_summary=envelope.user_message_summary,
                 deadline_offsets=envelope.deadline_offsets,
+                source_message_text=source_message,
+                follow_up_turns=(pending_state.follow_up_turns + 1) if pending_state is not None else 1,
             )
             self._save_pending_state(session, chat_id=chat_id, telegram_user_id=telegram_user_id, state=pending)
             self.audit.record_action(
@@ -116,6 +130,16 @@ class InterpretationService:
                 executor_result_json=json.dumps({"follow_up": follow_up_text}),
                 status="follow_up",
             )
+            self.feedback.record(
+                session,
+                chat_id=chat_id,
+                telegram_user_id=telegram_user_id,
+                message_text=message_text,
+                phase="follow_up",
+                outcome="needs_more_info",
+                error_code=checker_result.issues[0] if checker_result.issues else None,
+                details={"action": envelope.action, "question": follow_up_text},
+            )
             return BotResponsePlan(text=follow_up_text)
 
         self._clear_pending_state(session, chat_id=chat_id)
@@ -125,6 +149,7 @@ class InterpretationService:
                 text=(
                     "Try things like:\n"
                     "• Remind me tomorrow at 7 PM to pay rent\n"
+                    "• Remind me to go for Sony headset repair today morning 9am\n"
                     "• Wake me up every weekday at 6 AM\n"
                     "• Show my reminders\n"
                     "• Move my wake-up to 7 AM\n"
@@ -134,12 +159,15 @@ class InterpretationService:
             )
 
         if envelope.action == "list_reminders":
+            self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=message_text, phase="assistant", outcome="list")
             return BotResponsePlan(text=self.list_tool.execute(session, chat_id=chat_id))
 
         if envelope.action == "today_agenda":
+            self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=message_text, phase="assistant", outcome="today_agenda")
             return BotResponsePlan(text=self.today_tool.execute(session, chat_id=chat_id, timezone_name=pref.timezone))
 
         if envelope.action == "missed_summary":
+            self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=message_text, phase="assistant", outcome="missed_summary")
             return BotResponsePlan(text=self.missed_tool.execute(session, chat_id=chat_id))
 
         if envelope.action == "set_preferences":
@@ -159,6 +187,7 @@ class InterpretationService:
                 executor_result_json=json.dumps({"text": text}),
                 status="success",
             )
+            self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=message_text, phase="preferences", outcome="success")
             return BotResponsePlan(text=text)
 
         if envelope.action == "deadline_chain":
@@ -182,6 +211,10 @@ class InterpretationService:
                 executor_result_json=json.dumps({"text": text}),
                 status="success" if reminders else "error",
             )
+            if reminders:
+                self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=message_text, phase="deadline_chain", outcome="success")
+            else:
+                self._record_failure_learning(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=message_text, action_name=envelope.action, details={"text": text})
             return BotResponsePlan(text=text)
 
         if envelope.action == "create_reminder":
@@ -192,6 +225,7 @@ class InterpretationService:
                 recurrence=envelope.reminder.recurrence_text,
             )
             if duplicates:
+                self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=message_text, phase="create", outcome="duplicate_block")
                 return BotResponsePlan(
                     text="That looks similar to an existing reminder. Say it again with a clearer time, or use /list to check first."
                 )
@@ -222,6 +256,14 @@ class InterpretationService:
                     executor_result_json=json.dumps({"status": status}),
                     status="error",
                 )
+                self._record_failure_learning(
+                    session,
+                    chat_id=chat_id,
+                    telegram_user_id=telegram_user_id,
+                    message_text=message_text,
+                    action_name=envelope.action,
+                    details={"status": status, "time_phrase": envelope.reminder.datetime_text},
+                )
                 return BotResponsePlan(text=status)
             text = f"Okay — I created reminder #{reminder.id}: {reminder.task}."
             if reminder.requires_ack:
@@ -235,6 +277,16 @@ class InterpretationService:
                 executor_result_json=json.dumps({"text": text}),
                 status="success",
             )
+            self._record_success_learning(
+                session,
+                chat_id=chat_id,
+                telegram_user_id=telegram_user_id,
+                source_text=(pending_state.source_message_text if pending_state and pending_state.source_message_text else message_text),
+                action_name=envelope.action,
+                task=reminder.task,
+                time_phrase=envelope.reminder.datetime_text,
+                learned_from_follow_up=bool(pending_state is not None),
+            )
             return BotResponsePlan(text=text)
 
         if envelope.action in {"update_reminder", "delete_reminder"}:
@@ -247,8 +299,10 @@ class InterpretationService:
                 reminders=open_reminders,
             )
             if resolution.status == "none":
+                self._record_failure_learning(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=message_text, action_name=envelope.action, details={"status": "no_target"})
                 return BotResponsePlan(text=resolution.message or "I couldn't find that reminder.")
             if resolution.status == "ambiguous":
+                self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=message_text, phase="resolution", outcome="ambiguous_target")
                 if not self.settings.ai_enable_resolution_buttons or not resolution.candidates:
                     return BotResponsePlan(text=resolution.message or "That matches more than one reminder.")
                 keyboard = self.target_resolution.build_keyboard(ai_run_id=ai_run.id, candidates=resolution.candidates)
@@ -258,6 +312,7 @@ class InterpretationService:
             if envelope.action == "delete_reminder":
                 deleted, status = self.delete_tool.execute(session, scheduler=self.scheduler, chat_id=chat_id, reminder=target)
                 if deleted is None:
+                    self._record_failure_learning(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=message_text, action_name=envelope.action, details={"status": status})
                     return BotResponsePlan(text=status)
                 text = f"Cancelled reminder #{deleted.id}: {deleted.task}"
                 self.audit.record_action(
@@ -269,6 +324,7 @@ class InterpretationService:
                     executor_result_json=json.dumps({"text": text}),
                     status="success",
                 )
+                self._record_success_learning(session, chat_id=chat_id, telegram_user_id=telegram_user_id, source_text=message_text, action_name=envelope.action, task=deleted.task, time_phrase=None, learned_from_follow_up=False)
                 return BotResponsePlan(text=text)
             updated, status = self.update_tool.execute(
                 session,
@@ -285,6 +341,7 @@ class InterpretationService:
                 ai_confidence=checker_result.confidence,
             )
             if updated is None:
+                self._record_failure_learning(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=message_text, action_name=envelope.action, details={"status": status, "time_phrase": envelope.reminder.datetime_text})
                 return BotResponsePlan(text=status)
             text = f"Updated reminder #{updated.id}."
             self.audit.record_action(
@@ -296,8 +353,10 @@ class InterpretationService:
                 executor_result_json=json.dumps({"text": text}),
                 status="success",
             )
+            self._record_success_learning(session, chat_id=chat_id, telegram_user_id=telegram_user_id, source_text=message_text, action_name=envelope.action, task=updated.task, time_phrase=envelope.reminder.datetime_text, learned_from_follow_up=False)
             return BotResponsePlan(text=text)
 
+        self._record_failure_learning(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=message_text, action_name="clarify", details={"reason": "unknown_action"})
         return BotResponsePlan(text="I couldn't understand that. Try /help.")
 
     def handle_resolution_choice(self, session, *, ai_run_id: int, reminder_id: int, chat_id: int, telegram_user_id: int) -> str:
@@ -317,6 +376,8 @@ class InterpretationService:
         self.target_resolution.repo.mark_selected(session, ai_run_id=ai_run_id, reminder_id=reminder_id)
         if envelope.action == "delete_reminder":
             deleted, status = self.delete_tool.execute(session, scheduler=self.scheduler, chat_id=chat_id, reminder=reminder)
+            if deleted is not None:
+                self._record_success_learning(session, chat_id=chat_id, telegram_user_id=telegram_user_id, source_text=ai_run.message_text, action_name=envelope.action, task=deleted.task, time_phrase=None, learned_from_follow_up=False)
             return status if deleted is None else f"Cancelled reminder #{deleted.id}: {deleted.task}"
         updated, status = self.update_tool.execute(
             session,
@@ -332,6 +393,8 @@ class InterpretationService:
             target_selector_json=envelope.target.model_dump_json(),
             ai_confidence=float(ai_run.confidence or 0),
         )
+        if updated is not None:
+            self._record_success_learning(session, chat_id=chat_id, telegram_user_id=telegram_user_id, source_text=ai_run.message_text, action_name=envelope.action, task=updated.task, time_phrase=envelope.reminder.datetime_text, learned_from_follow_up=False)
         return status if updated is None else f"Updated reminder #{updated.id}."
 
     def _get_pending_state(self, session, *, chat_id: int) -> PendingConversationState | None:
@@ -385,10 +448,19 @@ class InterpretationService:
         text = message_text.strip()
         if missing:
             field = missing[0]
+            parsed_task, parsed_time = split_task_and_time_phrase(text)
             if field in {"missing_task", "task"}:
-                merged.reminder.task = text
+                if parsed_task:
+                    merged.reminder.task = parsed_task
+                elif not looks_like_time_phrase(text):
+                    merged.reminder.task = text
+                if merged.reminder.datetime_text is None and parsed_time:
+                    merged.reminder.datetime_text = normalize_time_phrase(parsed_time)
             elif field in {"missing_datetime", "time_phrase", "deadline_phrase"}:
-                merged.reminder.datetime_text = text
+                if parsed_time:
+                    merged.reminder.datetime_text = normalize_time_phrase(parsed_time)
+                else:
+                    merged.reminder.datetime_text = normalize_time_phrase(text)
             elif field in {"missing_target", "target"}:
                 merged.target.selector_text = text
             elif field in {"missing_preference_value", "preference_value"}:
@@ -419,3 +491,57 @@ class InterpretationService:
                 prefs.missed_summary_enabled = False
             return
         prefs.daily_agenda_time = text
+
+    def _record_success_learning(
+        self,
+        session,
+        *,
+        chat_id: int,
+        telegram_user_id: int,
+        source_text: str,
+        action_name: str,
+        task: str | None,
+        time_phrase: str | None,
+        learned_from_follow_up: bool,
+    ) -> None:
+        self.feedback.record(
+            session,
+            chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+            message_text=source_text,
+            phase=action_name,
+            outcome="success",
+            details={"task": task, "time_phrase": time_phrase},
+        )
+        self.example_memory.remember(
+            session,
+            chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+            source_text=source_text,
+            action_name=action_name,
+            resolved_task=task,
+            resolved_time_phrase=time_phrase,
+            learned_from_follow_up=learned_from_follow_up,
+        )
+        if time_phrase:
+            self.rule_suggester.remember_time_phrase(session, raw_phrase=time_phrase)
+
+    def _record_failure_learning(self, session, *, chat_id: int, telegram_user_id: int, message_text: str, action_name: str, details: dict) -> None:
+        self.feedback.record(
+            session,
+            chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+            message_text=message_text,
+            phase=action_name,
+            outcome="failure",
+            error_code="execution_failure",
+            details=details,
+        )
+        if self.settings.ai_enable_eval_logging:
+            self.eval_builder.add_candidate(
+                session,
+                label=f"auto::{action_name}",
+                input_text=message_text,
+                expected_action="create_reminder" if action_name == "create_reminder" else "clarify",
+                expected_json=details,
+            )

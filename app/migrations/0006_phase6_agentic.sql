@@ -54,3 +54,37 @@ CREATE TABLE IF NOT EXISTS eval_cases (
   expected_json TEXT,
   active INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE TABLE IF NOT EXISTS interaction_feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  chat_id INTEGER NOT NULL,
+  telegram_user_id INTEGER NOT NULL,
+  message_text TEXT NOT NULL,
+  phase TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  error_code TEXT,
+  details_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS correction_examples (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  chat_id INTEGER NOT NULL,
+  telegram_user_id INTEGER NOT NULL,
+  source_text TEXT NOT NULL,
+  action_name TEXT NOT NULL,
+  resolved_task TEXT,
+  resolved_time_phrase TEXT,
+  learned_from_follow_up INTEGER NOT NULL DEFAULT 0,
+  notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS learned_time_patterns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  raw_phrase TEXT NOT NULL UNIQUE,
+  normalized_phrase TEXT NOT NULL,
+  success_count INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);

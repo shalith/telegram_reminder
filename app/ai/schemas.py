@@ -83,6 +83,8 @@ class PendingConversationState(StrictBaseModel):
     follow_up: FollowUp = Field(default_factory=FollowUp)
     user_message_summary: str | None = None
     deadline_offsets: list[DeadlineOffset] = Field(default_factory=list)
+    source_message_text: str | None = None
+    follow_up_turns: int = 0
 
 
 class CandidateChoice(StrictBaseModel):

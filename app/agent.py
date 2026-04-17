@@ -11,6 +11,8 @@ from pydantic import ValidationError
 
 from app.agent_schema import AgentDecision, DeadlineOffset, PendingState
 from app.assistant_features import parse_deadline_offsets
+from app.ai.time_normalizer import looks_like_time_phrase, normalize_time_phrase
+from app.parser import split_task_and_time_phrase
 from app.config import Settings
 from app.models import Reminder
 from app.recurrence import format_dt_for_user, recurrence_label
@@ -119,10 +121,20 @@ class RuleBasedInterpreter:
         if pending_state.intent == "create":
             task = pending_state.task
             time_phrase = pending_state.time_phrase
-            if task is None and text:
-                task = text.strip(" .")
-            elif time_phrase is None and text:
-                time_phrase = text.strip(" .")
+            candidate_text = text.strip(" .")
+
+            if candidate_text:
+                parsed_task, parsed_time = split_task_and_time_phrase(candidate_text)
+                if task is None and parsed_task:
+                    task = parsed_task
+                elif task is None and not looks_like_time_phrase(candidate_text):
+                    task = candidate_text
+
+                if time_phrase is None and parsed_time:
+                    time_phrase = normalize_time_phrase(parsed_time)
+                elif time_phrase is None and looks_like_time_phrase(candidate_text):
+                    time_phrase = normalize_time_phrase(candidate_text)
+
             missing: list[str] = []
             ask_user = None
             if not task:
@@ -193,17 +205,7 @@ class RuleBasedInterpreter:
         if not remainder:
             return AgentDecision(intent="create", missing_fields=["task", "time_phrase"], ask_user=HELP_HINTS)
 
-        split_index = remainder.lower().rfind(" to ")
-        if split_index == -1:
-            about_match = re.match(r"^about\s+(.+?)\s+(?:on|at|tomorrow|next|this|every|in)\s+(.+)$", remainder, re.IGNORECASE)
-            if about_match:
-                task = about_match.group(1).strip(" .")
-                time_phrase = remainder[len("about " + about_match.group(1)) :].strip()
-                return AgentDecision(intent="create", task=task, time_phrase=time_phrase)
-            return AgentDecision(intent="create", missing_fields=["task"], ask_user="What should I remind you about?")
-
-        time_phrase = remainder[:split_index].strip()
-        task = remainder[split_index + 4 :].strip(" .")
+        task, time_phrase = split_task_and_time_phrase(remainder)
         missing: list[str] = []
         ask_user = None
         if not task:
@@ -212,7 +214,13 @@ class RuleBasedInterpreter:
         if not time_phrase:
             missing.append("time_phrase")
             ask_user = "When should I remind you?"
-        return AgentDecision(intent="create", task=task or None, time_phrase=time_phrase or None, missing_fields=missing, ask_user=ask_user)
+        return AgentDecision(
+            intent="create",
+            task=task or None,
+            time_phrase=normalize_time_phrase(time_phrase) if time_phrase else None,
+            missing_fields=missing,
+            ask_user=ask_user,
+        )
 
     def _parse_delete_intent(self, text: str) -> AgentDecision:
         id_match = re.search(r"#?(\d+)", text)
@@ -233,7 +241,7 @@ class RuleBasedInterpreter:
         match = re.match(r"^(?:move|change|reschedule|update)\s+(.+?)\s+(?:to|for|at)\s+(.+)$", text, re.IGNORECASE)
         if match:
             target_hint = match.group(1).strip(" .")
-            time_phrase = match.group(2).strip(" .")
+            time_phrase = normalize_time_phrase(match.group(2).strip(" ."))
             target_hint = re.sub(r"^(my|the)\s+", "", target_hint, flags=re.IGNORECASE).strip(" .")
             target_hint = re.sub(r"\s+reminder$", "", target_hint, flags=re.IGNORECASE).strip(" .")
             return AgentDecision(intent="update", target_reminder_id=target_id, target_hint=target_hint or None, time_phrase=time_phrase or None)

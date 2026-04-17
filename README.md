@@ -1,4 +1,4 @@
-# Telegram Reminder Bot — Phase 5 Hardening and Deployment Quality
+# Telegram Reminder Bot — Phase 6.1 Conversation Maturity + Phase 6.2 Learning Loop
 
 This project is a local-machine Telegram reminder assistant with:
 
@@ -18,6 +18,17 @@ This project is a local-machine Telegram reminder assistant with:
 - local health endpoint
 - CLI backup/export utilities
 - systemd and Docker deployment files
+
+
+This phase adds:
+
+- better task-first reminder extraction such as `Remind me to go for Sony headset repair today morning 9am`
+- stronger follow-up slot merging so replies like `Today morning 9` complete the draft reminder
+- time phrase normalization for inputs like `today morning 9` and `18th apr morning 8`
+- feedback capture for successes, failures, and follow-up gaps
+- example memory so successful real conversations can be reused as prompt examples
+- automatic eval-case candidate logging for failed interactions
+- learned time-pattern storage for normalized phrases
 
 ## What Phase 5 adds
 
