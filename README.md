@@ -306,3 +306,12 @@ curl http://127.0.0.1:8088/health
 
 ## Notes
 - On Railway, only one bot instance should poll Telegram at a time. This build retries automatically on short-lived polling conflicts during deploy overlap.
+
+## Phase 8 — Personal Memory Intelligence
+
+This package adds memory-based interpretation:
+- remembers task/time patterns from successful reminders
+- injects personal memory hints into the structured interpreter prompt
+- suggests likely follow-up times for known tasks
+- boosts confidence for familiar task + time-of-day combinations
+- stores task memory in `task_memory_profiles`

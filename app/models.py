@@ -159,6 +159,24 @@ class EvalCase(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+
+class TaskMemoryProfile(Base):
+    __tablename__ = "task_memory_profiles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    task_key: Mapped[str] = mapped_column(String(255), index=True)
+    sample_task: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    preferred_hour_local: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    preferred_minute_local: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    preferred_time_of_day: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    preferred_recurrence_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    use_count: Mapped[int] = mapped_column(Integer, default=0)
+    confirmed_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now(), onupdate=func.now())
+
 class PhraseRiskScore(Base):
     __tablename__ = "phrase_risk_scores"
 

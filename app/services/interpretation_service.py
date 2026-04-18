@@ -19,6 +19,9 @@ from app.service import ReminderService
 from app.services.audit_service import AuditService
 from app.services.duplicate_detection_service import DuplicateDetectionService
 from app.services.target_resolution_service import TargetResolutionService
+from app.phase7 import EvaluatorAgent, SemanticConflictDetector
+from app.phase8 import MemoryProfileStore, MemoryReasoner
+from app.phase9 import MultiPlanConfirmationState, MultiReminderPlanner, ProactiveSuggester
 from app.tools.create_reminder import CreateReminderTool
 from app.tools.deadline_chain import DeadlineChainTool
 from app.tools.delete_reminder import DeleteReminderTool
@@ -88,6 +91,12 @@ class InterpretationService:
         self.pref_tool = SetPreferencesTool(self.reminder_service)
         self.deadline_tool = DeadlineChainTool(self.reminder_service)
         self.missed_tool = MissedSummaryTool(self.reminder_service)
+        self.conflict_detector = SemanticConflictDetector()
+        self.evaluator = EvaluatorAgent(self.conflict_detector)
+        self.memory_profiles = MemoryProfileStore()
+        self.memory_reasoner = MemoryReasoner()
+        self.multi_planner = MultiReminderPlanner()
+        self.proactive_suggester = ProactiveSuggester()
 
     def _looks_like_new_request(self, message_text: str) -> bool:
         lowered = (message_text or '').strip().lower()
@@ -170,6 +179,22 @@ class InterpretationService:
         if lowered in smalltalk:
             return BotResponsePlan(text=smalltalk[lowered])
 
+        plan_state = self._get_multi_plan_state(session, chat_id=chat_id)
+        if plan_state is not None:
+            if lowered in {"yes", "y", "confirm", "confirm it"}:
+                return self._execute_multi_plan_state(
+                    session,
+                    state=plan_state,
+                    chat_id=chat_id,
+                    telegram_user_id=telegram_user_id,
+                )
+            if lowered in {"no", "n", "cancel", "stop"}:
+                self._clear_multi_plan_state(session, chat_id=chat_id)
+                return BotResponsePlan(text="Okay — I cancelled that multi-reminder plan.")
+            if self._looks_like_new_request(cleaned):
+                self._clear_multi_plan_state(session, chat_id=chat_id)
+                plan_state = None
+
         pref = self.reminder_service.get_or_create_preferences(
             session,
             chat_id=chat_id,
@@ -187,6 +212,22 @@ class InterpretationService:
         if confirmation_state is not None and self._looks_like_new_request(cleaned):
             self._clear_confirmation_state(session, chat_id=chat_id)
             confirmation_state = None
+
+        multi_plan = self.multi_planner.detect(prepared_message_text if "prepared_message_text" in locals() else cleaned, timezone_name=pref.timezone)
+        if multi_plan is not None:
+            self._clear_pending_state(session, chat_id=chat_id)
+            self._clear_confirmation_state(session, chat_id=chat_id)
+            state = MultiPlanConfirmationState(
+                source_message_text=message_text,
+                items=multi_plan.items,
+                confidence=multi_plan.confidence,
+                shared_context=multi_plan.shared_context,
+            )
+            self._save_multi_plan_state(session, chat_id=chat_id, telegram_user_id=telegram_user_id, state=state)
+            return BotResponsePlan(
+                text=self._build_multi_plan_confirmation_text(state),
+                reply_markup=self._build_confirmation_keyboard(),
+            )
 
         learning_context = self.self_learning.prepare(
             session,
@@ -230,6 +271,8 @@ class InterpretationService:
                 learned_examples.append(
                     f"risky_user='{item.example.source_text}' | action={item.example.action_name} | task='{item.example.resolved_task or ''}' | time='{item.example.resolved_time_phrase or ''}'"
                 )
+        matched_memory_profiles = self.memory_profiles.find_matches(session, telegram_user_id=telegram_user_id, message_text=prepared_message_text)
+        memory_profile_lines = self.memory_profiles.format_for_prompt(matched_memory_profiles)
         fastpath_wake = self._build_wake_up_envelope(prepared_message_text)
         if fastpath_wake is not None:
             interpreter_result = InterpreterResult(
@@ -247,6 +290,7 @@ class InterpretationService:
                 open_reminders=open_reminders,
                 preference_snapshot=self.reminder_service.format_preferences_summary(pref),
                 learned_examples=learned_examples,
+                memory_profile_lines=memory_profile_lines,
             )
         envelope = interpreter_result.envelope
         if pending_state is not None and envelope.action == "clarify":
@@ -256,6 +300,20 @@ class InterpretationService:
             if inferred is not None:
                 envelope = inferred
         envelope = apply_semantic_judgment(prepared_message_text, envelope, pref.timezone)
+        memory_reasoning = self.memory_reasoner.apply(
+            envelope=envelope,
+            message_text=prepared_message_text,
+            matched_profiles=matched_memory_profiles,
+        )
+        envelope.confidence = memory_reasoning.adjusted_confidence
+        for reason in memory_reasoning.reasons:
+            if reason not in envelope.reasoning_tags:
+                envelope.reasoning_tags.append(reason)
+        if memory_reasoning.follow_up_text and not envelope.follow_up.needed:
+            envelope.follow_up.needed = True
+            envelope.follow_up.question = memory_reasoning.follow_up_text
+            if 'datetime_text' not in envelope.follow_up.missing_fields:
+                envelope.follow_up.missing_fields.append('datetime_text')
         if learning_context.confidence_adjustment.reasons:
             envelope.confidence = learning_context.confidence_adjustment.adjusted_confidence
             for reason in learning_context.confidence_adjustment.reasons:
@@ -267,6 +325,16 @@ class InterpretationService:
         if learning_context.applied_patterns and "learned_time_pattern" not in envelope.reasoning_tags:
             envelope.reasoning_tags.append("learned_time_pattern")
         checker_result = self.checker.check(envelope=envelope, open_reminders=open_reminders)
+        evaluator_result = self.evaluator.evaluate(
+            envelope=envelope,
+            checker_result=checker_result,
+            open_reminders=open_reminders,
+            timezone_name=pref.timezone,
+        )
+        checker_result.confidence = evaluator_result.adjusted_confidence
+        for tag in evaluator_result.reasoning_tags:
+            if tag not in envelope.reasoning_tags:
+                envelope.reasoning_tags.append(tag)
 
         ai_run = self.audit.record_ai_run(
             session,
@@ -285,8 +353,8 @@ class InterpretationService:
             error_message=interpreter_result.error_message,
         )
 
-        if checker_result.follow_up_text or envelope.follow_up.needed:
-            follow_up_text = checker_result.follow_up_text or envelope.follow_up.question or "I need a bit more information."
+        if evaluator_result.follow_up_text or checker_result.follow_up_text or envelope.follow_up.needed:
+            follow_up_text = evaluator_result.follow_up_text or checker_result.follow_up_text or envelope.follow_up.question or "I need a bit more information."
             source_message = pending_state.source_message_text if pending_state and pending_state.source_message_text else message_text
             pending = PendingConversationState(
                 action=envelope.action,
@@ -326,7 +394,7 @@ class InterpretationService:
             )
             return BotResponsePlan(text=follow_up_text)
 
-        if self._should_request_confirmation(
+        if evaluator_result.force_confirmation or self._should_request_confirmation(
             envelope=envelope,
             interpreter_result=interpreter_result,
             confidence=checker_result.confidence,
@@ -339,7 +407,7 @@ class InterpretationService:
                 confidence=checker_result.confidence,
                 model_name=interpreter_result.model_name,
                 source_message_text=pending_state.source_message_text if pending_state and pending_state.source_message_text else message_text,
-                confirmation_reason=self._confirmation_reason(envelope, checker_result.confidence),
+                confirmation_reason=(evaluator_result.confirmation_text if evaluator_result.force_confirmation and evaluator_result.confirmation_text else self._confirmation_reason(envelope, checker_result.confidence)),
             )
             self._save_confirmation_state(session, chat_id=chat_id, telegram_user_id=telegram_user_id, state=state)
             self.feedback.record(
@@ -417,6 +485,23 @@ class InterpretationService:
             telegram_user_id=telegram_user_id,
             timezone_name=self.settings.default_timezone,
         )
+        plan_state = self._get_multi_plan_state(session, chat_id=chat_id)
+        if plan_state is not None:
+            if choice == "cancel":
+                self._clear_multi_plan_state(session, chat_id=chat_id)
+                return "Okay — I cancelled that multi-reminder plan."
+            if choice == "edit":
+                self._clear_multi_plan_state(session, chat_id=chat_id)
+                return "Okay — send me the corrected multi-reminder request in one message."
+            if choice == "confirm":
+                plan = self._execute_multi_plan_state(
+                    session,
+                    state=plan_state,
+                    chat_id=chat_id,
+                    telegram_user_id=telegram_user_id,
+                )
+                return plan.text
+
         confirmation_state = self._get_confirmation_state(session, chat_id=chat_id)
         if confirmation_state is None:
             return "That confirmation has expired. Please send the request again."
@@ -515,11 +600,20 @@ class InterpretationService:
 
         if envelope.action == "list_reminders":
             self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=original_message_text, phase="assistant", outcome="list")
-            return BotResponsePlan(text=self.list_tool.execute(session, chat_id=chat_id))
+            list_text = self.list_tool.execute(session, chat_id=chat_id)
+            suggestions = self.proactive_suggester.suggestions_for_list(open_reminders)
+            if suggestions:
+                list_text += "\n\nSuggestion: " + suggestions[0]
+            return BotResponsePlan(text=list_text)
 
         if envelope.action == "today_agenda":
             self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=original_message_text, phase="assistant", outcome="today_agenda")
-            return BotResponsePlan(text=self.today_tool.execute(session, chat_id=chat_id, timezone_name=pref.timezone))
+            today_text = self.today_tool.execute(session, chat_id=chat_id, timezone_name=pref.timezone)
+            today_items = self.reminder_service.list_today_reminders(session, chat_id=chat_id, timezone_name=pref.timezone)
+            suggestions = self.proactive_suggester.suggestions_for_agenda(today_items)
+            if suggestions:
+                today_text += "\n\nSuggestion: " + suggestions[0]
+            return BotResponsePlan(text=today_text)
 
         if envelope.action == "missed_summary":
             self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=original_message_text, phase="assistant", outcome="missed_summary")
@@ -552,6 +646,11 @@ class InterpretationService:
             self.audit.record_action(session, user_id=telegram_user_id, reminder_id=reminders[0].id if reminders else None, action_name=envelope.action, action_args_json=envelope.model_dump_json(), executor_result_json=json.dumps({"text": text}), status="success" if reminders else "error")
             if reminders:
                 self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=original_message_text, phase="deadline_chain", outcome="confirmed_success" if was_confirmed else "success")
+                for reminder in reminders:
+                    self.memory_profiles.remember_from_values(session, telegram_user_id=telegram_user_id, task=reminder.task, hour_local=reminder.hour_local, minute_local=reminder.minute_local, recurrence_type=reminder.recurrence_type, confirmed=was_confirmed)
+                suggestions = self.proactive_suggester.suggestions_after_create(session, chat_id=chat_id, created_reminders=reminders, open_reminders=open_reminders)
+                if suggestions:
+                    text += "\n\nSuggestion: " + suggestions[0]
             else:
                 self._record_failure_learning(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=original_message_text, action_name=envelope.action, details={"text": text})
             return BotResponsePlan(text=text)
@@ -594,6 +693,7 @@ class InterpretationService:
                 text = "Confirmed — " + text[0].lower() + text[1:]
             self.audit.record_action(session, user_id=telegram_user_id, reminder_id=reminder.id, action_name=envelope.action, action_args_json=envelope.model_dump_json(), executor_result_json=json.dumps({"text": text}), status="success")
             self._record_success_learning(session, chat_id=chat_id, telegram_user_id=telegram_user_id, source_text=source_text or original_message_text, action_name=envelope.action, task=reminder.task, time_phrase=envelope.reminder.datetime_text, learned_from_follow_up=False, notes=("confirmed" if was_confirmed else "success"))
+            self.memory_profiles.remember_from_values(session, telegram_user_id=telegram_user_id, task=reminder.task, hour_local=reminder.hour_local, minute_local=reminder.minute_local, recurrence_type=reminder.recurrence_type, confirmed=was_confirmed)
             return BotResponsePlan(text=text)
 
         if envelope.action in {"update_reminder", "delete_reminder"}:
@@ -684,6 +784,8 @@ class InterpretationService:
 
     def _build_confirmation_text(self, state: ConfirmationState) -> str:
         envelope = state.envelope
+        if state.confirmation_reason and state.confirmation_reason.startswith('I understood this as'):
+            return state.confirmation_reason
         semantic_text = build_semantic_confirmation_text(envelope)
         if semantic_text:
             return semantic_text
@@ -722,6 +824,84 @@ class InterpretationService:
             return PendingConversationState.model_validate_json(row.state_json)
         except Exception:
             return None
+
+    def _build_multi_plan_confirmation_text(self, state: MultiPlanConfirmationState) -> str:
+        lines = [
+            'I found multiple reminders in your message. Confirm and I will create all of them:',
+            *[f"• {item.task} — {item.time_phrase}" for item in state.items],
+        ]
+        return "\n".join(lines)
+
+    def _get_multi_plan_state(self, session, *, chat_id: int) -> MultiPlanConfirmationState | None:
+        stmt = select(ConversationState).where(ConversationState.chat_id == chat_id)
+        row = session.scalar(stmt)
+        if row is None or row.pending_intent != "phase9_plan_confirm":
+            return None
+        try:
+            return MultiPlanConfirmationState.model_validate_json(row.state_json)
+        except Exception:
+            return None
+
+    def _save_multi_plan_state(self, session, *, chat_id: int, telegram_user_id: int, state: MultiPlanConfirmationState) -> None:
+        stmt = select(ConversationState).where(ConversationState.chat_id == chat_id)
+        row = session.scalar(stmt)
+        payload = state.model_dump_json()
+        if row is None:
+            row = ConversationState(chat_id=chat_id, telegram_user_id=telegram_user_id, pending_intent="phase9_plan_confirm", state_json=payload)
+            session.add(row)
+        else:
+            row.telegram_user_id = telegram_user_id
+            row.pending_intent = "phase9_plan_confirm"
+            row.state_json = payload
+        session.commit()
+
+    def _clear_multi_plan_state(self, session, *, chat_id: int) -> None:
+        stmt = select(ConversationState).where(ConversationState.chat_id == chat_id)
+        row = session.scalar(stmt)
+        if row is not None and row.pending_intent == "phase9_plan_confirm":
+            session.delete(row)
+            session.commit()
+
+    def _execute_multi_plan_state(self, session, *, state: MultiPlanConfirmationState, chat_id: int, telegram_user_id: int) -> BotResponsePlan:
+        pref = self.reminder_service.get_or_create_preferences(
+            session,
+            chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+            timezone_name=self.settings.default_timezone,
+        )
+        open_reminders = self.reminder_service.list_open_reminders(session, chat_id=chat_id)
+        created = []
+        lines = []
+        for item in state.items:
+            reminder, status = self.create_tool.execute(
+                session,
+                scheduler=self.scheduler,
+                incoming_text=state.source_message_text,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                timezone_name=pref.timezone,
+                task=item.task,
+                time_phrase=item.time_phrase,
+                requires_ack=item.requires_ack,
+                retry_interval_minutes=pref.wakeup_retry_interval_minutes,
+                max_attempts=pref.wakeup_max_attempts,
+                source_mode="phase9-plan",
+                interpretation_json=None,
+                target_selector_json=None,
+                ai_confidence=state.confidence,
+            )
+            if reminder is not None:
+                created.append(reminder)
+                lines.append(f"• Created reminder #{reminder.id}: {reminder.task}")
+                self.memory_profiles.remember_from_values(session, telegram_user_id=telegram_user_id, task=reminder.task, hour_local=reminder.hour_local, minute_local=reminder.minute_local, recurrence_type=reminder.recurrence_type, confirmed=True)
+            else:
+                lines.append(f"• Could not create '{item.task}' — {status}")
+        self._clear_multi_plan_state(session, chat_id=chat_id)
+        suggestions = self.proactive_suggester.suggestions_after_create(session, chat_id=chat_id, created_reminders=created, open_reminders=open_reminders)
+        text = "Done — here is your plan:\n" + "\n".join(lines) if lines else "I couldn't create that plan."
+        if suggestions:
+            text += "\n\nSuggestion: " + suggestions[0]
+        return BotResponsePlan(text=text)
 
     def _save_pending_state(self, session, *, chat_id: int, telegram_user_id: int, state: PendingConversationState) -> None:
         stmt = select(ConversationState).where(ConversationState.chat_id == chat_id)

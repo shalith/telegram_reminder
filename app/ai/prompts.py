@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from app.ai.schemas import PendingConversationState
 
-PROMPT_VERSION = "phase6_4_semantic_repair_v1"
+PROMPT_VERSION = "phase8_memory_interpretation_v1"
 
 SYSTEM_PROMPT_V1 = """You are the interpreter for a Telegram reminder assistant.
 Convert each user message into a strict JSON object that matches the provided schema.
@@ -29,16 +29,19 @@ def build_developer_prompt(
     recent_reminders: list[str],
     pending_state: PendingConversationState | None,
     learned_examples: list[str] | None = None,
+    memory_profile_lines: list[str] | None = None,
 ) -> str:
     reminder_text = "\n".join(recent_reminders) if recent_reminders else "(none)"
     pending_json = pending_state.model_dump_json(indent=2) if pending_state is not None else "null"
     example_text = "\n".join(learned_examples or []) or "(none)"
+    memory_text = "\n".join(memory_profile_lines or []) or "(none)"
     return (
         f"Prompt version: {PROMPT_VERSION}\n"
         f"Current timezone: {timezone_name}\n"
         f"Known preferences:\n{preference_snapshot}\n\n"
         f"Recent reminders:\n{reminder_text}\n\n"
         f"Learned successful examples:\n{example_text}\n\n"
+        f"Personal memory patterns:\n{memory_text}\n\n"
         f"Pending conversation state:\n{pending_json}"
     )
 

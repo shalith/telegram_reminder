@@ -28,6 +28,8 @@ class Settings:
     ai_confirm_wakeups: bool = True
     ai_enable_eval_logging: bool = True
     ai_enable_resolution_buttons: bool = True
+    ai_memory_enabled: bool = True
+    ai_memory_max_profiles: int = 3
     otel_enabled: bool = False
     otel_exporter_endpoint: str | None = None
 
@@ -70,6 +72,8 @@ class Settings:
             ai_confirm_wakeups=os.getenv("AI_CONFIRM_WAKEUPS", "true").strip().lower() not in {"0", "false", "no"},
             ai_enable_eval_logging=os.getenv("AI_ENABLE_EVAL_LOGGING", "true").strip().lower() not in {"0", "false", "no"},
             ai_enable_resolution_buttons=os.getenv("AI_ENABLE_RESOLUTION_BUTTONS", "true").strip().lower() not in {"0", "false", "no"},
+            ai_memory_enabled=os.getenv("AI_MEMORY_ENABLED", "true").strip().lower() not in {"0", "false", "no"},
+            ai_memory_max_profiles=int(os.getenv("AI_MEMORY_MAX_PROFILES", "3")),
             otel_enabled=os.getenv("OTEL_ENABLED", "false").strip().lower() in {"1", "true", "yes"},
             otel_exporter_endpoint=os.getenv("OTEL_EXPORTER_ENDPOINT", "").strip() or None,
         )
