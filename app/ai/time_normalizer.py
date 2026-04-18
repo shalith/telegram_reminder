@@ -9,6 +9,7 @@ _TIME_HINT_RE = re.compile(
     rf"\b(today|tomorrow|tonight|morning|afternoon|evening|night|noon|midnight|next\s+(?:{WEEKDAY_WORDS})|this\s+(?:{WEEKDAY_WORDS})|every\s+(?:day|weekday|{WEEKDAY_WORDS})|in\s+\d+\s+(?:minutes?|hours?|days?)|(?:\d{{1,2}})(?:st|nd|rd|th)?\s+(?:{MONTH_WORDS})(?:\s+\d{{4}})?|at\s+\d|\d{{1,2}}(?::\d{{2}})?\s*(?:am|pm))\b",
     re.IGNORECASE,
 )
+_APPROXIMATE_RE = re.compile(r"\b(?:around|about|approximately|approx(?:\.)?|ish)\b", re.IGNORECASE)
 
 
 def looks_like_time_phrase(text: str) -> bool:
@@ -23,6 +24,7 @@ def normalize_time_phrase(text: str) -> str:
     if not value:
         return value
 
+    value = re.sub(r"\b(around|about|approximately|approx(?:\.)?|ish)\s+", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\b(\d{1,2})(am|pm)\b", r"\1 \2", value, flags=re.IGNORECASE)
     value = re.sub(r"\bat\s+today\b", "today", value, flags=re.IGNORECASE)
     value = re.sub(r"\bat\s+tomorrow\b", "tomorrow", value, flags=re.IGNORECASE)
@@ -75,3 +77,10 @@ def normalize_time_phrase(text: str) -> str:
     value = re.sub(r"\b(\d{1,2})\s+o'clock\b", r"\1", value, flags=re.IGNORECASE)
     value = re.sub(r"\s+", " ", value).strip()
     return value
+
+
+def contains_approximate_time_language(text: str) -> bool:
+    normalized = " ".join((text or "").strip().split())
+    if not normalized:
+        return False
+    return bool(_APPROXIMATE_RE.search(normalized))

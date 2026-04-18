@@ -136,6 +136,10 @@ def split_task_and_time_phrase(remainder: str) -> tuple[str | None, str | None]:
     if anchor_match is not None and anchor_match.start() > 0:
         task = value[: anchor_match.start()].strip(" .,")
         time_phrase = value[anchor_match.start() :].strip(" .,")
+        approx_match = re.search(r"\b(around|about|approximately|approx(?:\.)?|ish)\s*$", task, re.IGNORECASE)
+        if approx_match is not None:
+            time_phrase = f"{approx_match.group(1)} {time_phrase}".strip()
+            task = task[: approx_match.start()].strip(" .,")
         if task and looks_like_time_phrase(time_phrase):
             return cleanup_task_prefix(task), time_phrase
 
@@ -152,6 +156,7 @@ def split_task_and_time_phrase(remainder: str) -> tuple[str | None, str | None]:
 def cleanup_task_prefix(task: str) -> str:
     cleaned = task.strip(" .")
     cleaned = re.sub(r"^(to|about)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+(around|about|approximately|approx(?:\.)?|ish)$", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip(" .")
 
 

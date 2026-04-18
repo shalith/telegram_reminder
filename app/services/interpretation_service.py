@@ -8,7 +8,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.ai.checker import InterpretationChecker
 from app.ai.interpreter import InterpreterResult, StructuredInterpreter
-from app.ai.schemas import ConfirmationState, FollowUp, InterpretationEnvelope, PendingConversationState
+from app.ai.schemas import ConfirmationState, FollowUp, InterpretationEnvelope, PendingConversationState, ReminderDraft, TargetSelector, PreferencePatch
 from app.config import Settings
 from app.learning import EvalBuilder, ExampleMemoryStore, FeedbackStore, RuleSuggester
 from app.models import ConversationState
@@ -27,12 +27,39 @@ from app.tools.set_preferences import SetPreferencesTool
 from app.tools.today_agenda import TodayAgendaTool
 from app.tools.update_reminder import UpdateReminderTool
 from app.ai.time_normalizer import looks_like_time_phrase, normalize_time_phrase
+from app.semantic_judgment import (
+    apply_semantic_judgment,
+    build_semantic_confirmation_text,
+    detect_repair_signal,
+    infer_indirect_reminder,
+    should_confirm_for_semantics,
+)
 
 
 @dataclass(slots=True)
 class BotResponsePlan:
     text: str
     reply_markup: InlineKeyboardMarkup | None = None
+
+
+def latest_to_draft(reminder) -> ReminderDraft:
+    return ReminderDraft(
+        task=reminder.task,
+        datetime_text=None,
+        recurrence_text=None,
+        timezone=reminder.timezone,
+        is_wake_up=bool(reminder.requires_ack),
+        requires_ack=bool(reminder.requires_ack),
+        priority="high" if reminder.requires_ack else "normal",
+    )
+
+
+def latest_to_target(reminder) -> TargetSelector:
+    return TargetSelector(
+        selector_text=f"reminder #{reminder.id}",
+        reminder_id=reminder.id,
+        task_hint=reminder.task,
+    )
 
 
 class InterpretationService:
@@ -100,6 +127,16 @@ class InterpretationService:
                 self._clear_confirmation_state(session, chat_id=chat_id)
                 return BotResponsePlan(text="Okay — I cancelled that pending action.")
 
+        repair_plan = self._try_repair_conversation(
+            session,
+            chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+            message_text=message_text,
+            open_reminders=open_reminders,
+        )
+        if repair_plan is not None:
+            return repair_plan
+
         learned_examples = self.example_memory.format_for_prompt(
             self.example_memory.find_similar(session, telegram_user_id=telegram_user_id, message_text=message_text)
         )
@@ -114,6 +151,11 @@ class InterpretationService:
         envelope = interpreter_result.envelope
         if pending_state is not None and envelope.action == "clarify":
             envelope = self._merge_pending_state(pending_state, message_text)
+        if envelope.action == "clarify":
+            inferred = infer_indirect_reminder(message_text)
+            if inferred is not None:
+                envelope = inferred
+        envelope = apply_semantic_judgment(message_text, envelope, pref.timezone)
         checker_result = self.checker.check(envelope=envelope, open_reminders=open_reminders)
 
         ai_run = self.audit.record_ai_run(
@@ -121,7 +163,7 @@ class InterpretationService:
             user_id=telegram_user_id,
             chat_id=chat_id,
             message_text=message_text,
-            system_prompt_version="phase6_3_confirmation_v1",
+            system_prompt_version="phase6_4_semantic_repair_v1",
             model_name=interpreter_result.model_name,
             raw_response_text=interpreter_result.raw_response_text,
             parsed_json=envelope.model_dump_json(),
@@ -481,6 +523,8 @@ class InterpretationService:
     def _should_request_confirmation(self, *, envelope: InterpretationEnvelope, interpreter_result: InterpreterResult, confidence: float) -> bool:
         if envelope.action not in {"create_reminder", "update_reminder", "delete_reminder", "deadline_chain"}:
             return False
+        if should_confirm_for_semantics(envelope):
+            return True
         if interpreter_result.model_name == "rule-fallback" and not envelope.reminder.is_wake_up:
             return False
         if envelope.reminder.is_wake_up and self.settings.ai_confirm_wakeups:
@@ -490,6 +534,15 @@ class InterpretationService:
         return confidence >= self.settings.ai_confirmation_min_confidence
 
     def _confirmation_reason(self, envelope: InterpretationEnvelope, confidence: float) -> str:
+        tags = set(envelope.reasoning_tags)
+        if "repair_conversation" in tags:
+            return "repair_conversation"
+        if "suspicious_time" in tags:
+            return "suspicious_time"
+        if "approximate_time" in tags:
+            return "approximate_time"
+        if "indirect_intent" in tags:
+            return "indirect_intent"
         if envelope.reminder.is_wake_up and self.settings.ai_confirm_wakeups:
             return "wake_up_safety"
         if confidence < self.settings.ai_min_auto_execute_confidence:
@@ -498,6 +551,9 @@ class InterpretationService:
 
     def _build_confirmation_text(self, state: ConfirmationState) -> str:
         envelope = state.envelope
+        semantic_text = build_semantic_confirmation_text(envelope)
+        if semantic_text:
+            return semantic_text
         task = envelope.reminder.task or "this reminder"
         when = envelope.reminder.datetime_text or "that time"
         if envelope.action == "create_reminder":
@@ -616,6 +672,64 @@ class InterpretationService:
             elif field in {"missing_preference_value", "preference_value"}:
                 self._apply_preference_value(merged.preferences, text)
         return merged
+
+    def _try_repair_conversation(self, session, *, chat_id: int, telegram_user_id: int, message_text: str, open_reminders: list) -> BotResponsePlan | None:
+        signal = detect_repair_signal(message_text)
+        if signal is None:
+            return None
+        if not open_reminders:
+            if signal.needs_follow_up and signal.ask_user:
+                return BotResponsePlan(text=signal.ask_user)
+            return None
+
+        latest = max(open_reminders, key=lambda reminder: reminder.id)
+        if signal.needs_follow_up and signal.ask_user:
+            pending = PendingConversationState(
+                action="update_reminder",
+                reminder=latest_to_draft(latest),
+                target=latest_to_target(latest),
+                follow_up=FollowUp(
+                    needed=True,
+                    question=f"Understood — what time should I use for reminder #{latest.id} ({latest.task}) instead?",
+                    missing_fields=["time_phrase"],
+                ),
+                user_message_summary="repair_follow_up",
+                source_message_text=message_text,
+                follow_up_turns=1,
+            )
+            self._save_pending_state(session, chat_id=chat_id, telegram_user_id=telegram_user_id, state=pending)
+            return BotResponsePlan(text=pending.follow_up.question or signal.ask_user)
+
+        if signal.corrected_time_phrase:
+            envelope = InterpretationEnvelope(
+                action="update_reminder",
+                confidence=0.90,
+                reminder=latest_to_draft(latest),
+                target=latest_to_target(latest),
+                preferences=PreferencePatch(),
+                follow_up=FollowUp(needed=False, question=None, missing_fields=[]),
+                user_message_summary="repair_conversation",
+                reasoning_tags=["repair_conversation"],
+                deadline_offsets=[],
+            )
+            envelope.reminder.datetime_text = signal.corrected_time_phrase
+            envelope = apply_semantic_judgment(message_text, envelope, latest.timezone)
+            state = ConfirmationState(
+                action=envelope.action,
+                envelope=envelope,
+                ai_run_id=None,
+                confidence=0.90,
+                model_name="semantic-repair",
+                source_message_text=message_text,
+                confirmation_reason="repair_conversation",
+            )
+            self._save_confirmation_state(session, chat_id=chat_id, telegram_user_id=telegram_user_id, state=state)
+            return BotResponsePlan(
+                text=self._build_confirmation_text(state),
+                reply_markup=self._build_confirmation_keyboard(),
+            )
+
+        return None
 
     def _apply_preference_value(self, prefs, text: str) -> None:
         lowered = text.lower().strip()
