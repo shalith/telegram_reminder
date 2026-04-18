@@ -38,6 +38,28 @@ class StructuredInterpreter:
         self.rule_fallback = RuleBasedInterpreter()
         self.client = Groq(api_key=settings.groq_api_key) if settings.groq_enabled and Groq is not None else None
 
+
+    def _coerce_raw_payload(self, raw_text: str) -> dict:
+        try:
+            payload = json.loads(raw_text or "{}")
+        except Exception:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        if payload.get("reminder") is None or not isinstance(payload.get("reminder"), dict):
+            payload["reminder"] = {}
+        if payload.get("target") is None or not isinstance(payload.get("target"), dict):
+            payload["target"] = {}
+        if payload.get("preferences") is None or not isinstance(payload.get("preferences"), dict):
+            payload["preferences"] = {}
+        if payload.get("follow_up") is None or not isinstance(payload.get("follow_up"), dict):
+            payload["follow_up"] = {}
+        if payload.get("reasoning_tags") is None or not isinstance(payload.get("reasoning_tags"), list):
+            payload["reasoning_tags"] = []
+        if payload.get("deadline_offsets") is None or not isinstance(payload.get("deadline_offsets"), list):
+            payload["deadline_offsets"] = []
+        return payload
+
     def interpret(
         self,
         *,
@@ -80,7 +102,8 @@ class StructuredInterpreter:
                 },
             )
             raw = response.choices[0].message.content or "{}"
-            envelope = InterpretationEnvelope.model_validate_json(raw)
+            payload = self._coerce_raw_payload(raw)
+            envelope = InterpretationEnvelope.model_validate(payload)
             if envelope.action == "clarify" and fallback_envelope.action != "clarify":
                 return InterpreterResult(envelope=fallback_envelope, raw_response_text=raw, model_name=self.settings.groq_model, validation_ok=True)
             return InterpreterResult(envelope=envelope, raw_response_text=raw, model_name=self.settings.groq_model, validation_ok=True)

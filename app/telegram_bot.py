@@ -4,6 +4,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from app.config import Settings
@@ -52,6 +53,7 @@ class TelegramReminderBot:
         application.add_handler(CommandHandler("delete", self.delete_command))
         application.add_handler(CallbackQueryHandler(self.handle_callback_query, pattern=r"^(ack|snooze|resolve|confirm):"))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message))
+        application.add_error_handler(self.handle_error)
         return application
 
     async def _post_init(self, application: Application) -> None:
@@ -127,6 +129,7 @@ class TelegramReminderBot:
             )
         await self._reply_text(update, plan.text, reply_markup=plan.reply_markup)
 
+
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         if query is None or update.effective_chat is None or update.effective_user is None:
@@ -138,106 +141,121 @@ class TelegramReminderBot:
         parts = callback_data.split(":")
         action = parts[0]
 
-        if action == "resolve":
-            if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
-                if query.message is not None:
-                    await query.message.reply_text("That selection payload is invalid.")
-                    self.runtime_state.record_outbound_message()
-                return
-            ai_run_id = int(parts[1])
-            reminder_id = int(parts[2])
-            with get_session() as session:
-                text = self.interpretation_service.handle_resolution_choice(
-                    session,
-                    ai_run_id=ai_run_id,
-                    reminder_id=reminder_id,
-                    chat_id=update.effective_chat.id,
-                    telegram_user_id=update.effective_user.id,
-                )
-            if query.message is not None:
-                await query.edit_message_reply_markup(reply_markup=None)
-                await query.message.reply_text(text)
-                self.runtime_state.record_outbound_message()
-            return
-
-        if action == "confirm":
-            choice = parts[1] if len(parts) >= 2 else ""
-            with get_session() as session:
-                text = self.interpretation_service.handle_confirmation_choice(
-                    session,
-                    choice=choice,
-                    chat_id=update.effective_chat.id,
-                    telegram_user_id=update.effective_user.id,
-                )
-            if query.message is not None:
-                await query.edit_message_reply_markup(reply_markup=None)
-                await query.message.reply_text(text)
-                self.runtime_state.record_outbound_message()
-            return
-
-        if len(parts) < 2 or not parts[1].isdigit():
-            if query.message is not None:
-                await query.message.reply_text("That action payload is invalid.")
-                self.runtime_state.record_outbound_message()
-            return
-
-        reminder_id = int(parts[1])
-        with get_session() as session:
-            reminder = self.service.get_reminder(session, reminder_id=reminder_id)
-            preference = self.service.get_or_create_preferences(
-                session,
-                chat_id=update.effective_chat.id,
-                telegram_user_id=update.effective_user.id,
-                timezone_name=self.settings.default_timezone,
-            )
-            if reminder is None or reminder.chat_id != update.effective_chat.id:
-                if query.message is not None:
-                    await query.message.reply_text("I couldn't find that reminder.")
-                    self.runtime_state.record_outbound_message()
-                return
-
-            if action == "ack":
-                if reminder.status != ReminderStatus.PENDING_ACK.value:
+        try:
+            if action == "resolve":
+                if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
                     if query.message is not None:
-                        await query.message.reply_text("That reminder is not waiting for acknowledgement anymore.")
+                        await query.message.reply_text("That selection payload is invalid.")
                         self.runtime_state.record_outbound_message()
                     return
-                self.scheduler.remove_reminder_job(reminder.job_id)
-                updated = self.service.acknowledge_reminder(session, reminder=reminder, acked_at_utc=datetime.now(UTC))
-                self.scheduler.schedule_reminder(updated.id, updated.next_run_at_utc, updated.job_id)
+                ai_run_id = int(parts[1])
+                reminder_id = int(parts[2])
+                with get_session() as session:
+                    text = self.interpretation_service.handle_resolution_choice(
+                        session,
+                        ai_run_id=ai_run_id,
+                        reminder_id=reminder_id,
+                        chat_id=update.effective_chat.id,
+                        telegram_user_id=update.effective_user.id,
+                    )
                 if query.message is not None:
-                    await query.edit_message_reply_markup(reply_markup=None)
-                    if updated.status == ReminderStatus.ACTIVE.value and updated.next_run_at_utc is not None:
-                        next_run = format_dt_for_user(updated.next_run_at_utc, updated.timezone)
-                        await query.message.reply_text(
-                            f"Got it — reminder #{updated.id} acknowledged. Next wake-up: {next_run}."
+                    await self._safe_clear_callback_markup(query)
+                    await query.message.reply_text(text)
+                    self.runtime_state.record_outbound_message()
+                return
+
+            if action == "confirm":
+                choice = parts[1] if len(parts) >= 2 else ""
+                with get_session() as session:
+                    text = self.interpretation_service.handle_confirmation_choice(
+                        session,
+                        choice=choice,
+                        chat_id=update.effective_chat.id,
+                        telegram_user_id=update.effective_user.id,
+                    )
+                if query.message is not None:
+                    await self._safe_clear_callback_markup(query)
+                    await query.message.reply_text(text)
+                    self.runtime_state.record_outbound_message()
+                return
+
+            if len(parts) < 2 or not parts[1].isdigit():
+                if query.message is not None:
+                    await query.message.reply_text("That action payload is invalid.")
+                    self.runtime_state.record_outbound_message()
+                return
+
+            reminder_id = int(parts[1])
+            with get_session() as session:
+                reminder = self.service.get_reminder(session, reminder_id=reminder_id)
+                preference = self.service.get_or_create_preferences(
+                    session,
+                    chat_id=update.effective_chat.id,
+                    telegram_user_id=update.effective_user.id,
+                    timezone_name=self.settings.default_timezone,
+                )
+                if reminder is None or reminder.chat_id != update.effective_chat.id:
+                    if query.message is not None:
+                        await query.message.reply_text("I couldn't find that reminder.")
+                        self.runtime_state.record_outbound_message()
+                    return
+
+                if action == "ack":
+                    if reminder.status != ReminderStatus.PENDING_ACK.value:
+                        if query.message is not None:
+                            await query.message.reply_text("That reminder is not waiting for acknowledgement anymore.")
+                            self.runtime_state.record_outbound_message()
+                        return
+                    self.scheduler.remove_reminder_job(reminder.job_id)
+                    updated = self.service.acknowledge_reminder(session, reminder=reminder, acked_at_utc=datetime.now(UTC))
+                    self.scheduler.schedule_reminder(updated.id, updated.next_run_at_utc, updated.job_id)
+                    if query.message is not None:
+                        await self._safe_clear_callback_markup(query)
+                        if updated.status == ReminderStatus.ACTIVE.value and updated.next_run_at_utc is not None:
+                            next_run = format_dt_for_user(updated.next_run_at_utc, updated.timezone)
+                            await query.message.reply_text(
+                                f"Got it — reminder #{updated.id} acknowledged. Next wake-up: {next_run}."
+                            )
+                        else:
+                            await query.message.reply_text(f"Got it — reminder #{updated.id} acknowledged.")
+                        self.runtime_state.record_outbound_message()
+                    return
+
+                if action == "snooze":
+                    self.scheduler.remove_reminder_job(reminder.job_id)
+                    snooze_until = datetime.now(UTC) + timedelta(minutes=preference.default_snooze_minutes)
+                    updated = self.service.snooze_reminder(session, reminder=reminder, snooze_until_utc=snooze_until)
+                    self.scheduler.schedule_reminder(updated.id, updated.next_run_at_utc, updated.job_id)
+                    if query.message is not None:
+                        await self._safe_clear_callback_markup(query)
+                        next_run = (
+                            format_dt_for_user(updated.next_run_at_utc, updated.timezone)
+                            if updated.next_run_at_utc
+                            else "later"
                         )
-                    else:
-                        await query.message.reply_text(f"Got it — reminder #{updated.id} acknowledged.")
-                    self.runtime_state.record_outbound_message()
-                return
+                        await query.message.reply_text(
+                            f"Snoozed reminder #{updated.id} for {preference.default_snooze_minutes} minutes. Next alert: {next_run}."
+                        )
+                        self.runtime_state.record_outbound_message()
+                    return
 
-            if action == "snooze":
-                self.scheduler.remove_reminder_job(reminder.job_id)
-                snooze_until = datetime.now(UTC) + timedelta(minutes=preference.default_snooze_minutes)
-                updated = self.service.snooze_reminder(session, reminder=reminder, snooze_until_utc=snooze_until)
-                self.scheduler.schedule_reminder(updated.id, updated.next_run_at_utc, updated.job_id)
-                if query.message is not None:
-                    await query.edit_message_reply_markup(reply_markup=None)
-                    next_run = (
-                        format_dt_for_user(updated.next_run_at_utc, updated.timezone)
-                        if updated.next_run_at_utc
-                        else "later"
-                    )
-                    await query.message.reply_text(
-                        f"Snoozed reminder #{updated.id} for {preference.default_snooze_minutes} minutes. Next alert: {next_run}."
-                    )
-                    self.runtime_state.record_outbound_message()
-                return
+            if query.message is not None:
+                await query.message.reply_text("That action is not supported.")
+                self.runtime_state.record_outbound_message()
+        except Exception:
+            logger.exception("Callback query handling failed", extra={"event": "callback_query_failed", "callback_data": callback_data})
+            if query.message is not None:
+                await query.message.reply_text("Sorry — that button action failed. Please try the request again.")
+                self.runtime_state.record_outbound_message()
 
-        if query.message is not None:
-            await query.message.reply_text("That action is not supported.")
-            self.runtime_state.record_outbound_message()
+    async def _safe_clear_callback_markup(self, query) -> None:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            logger.warning("Failed to clear callback markup", extra={"event": "clear_callback_markup_failed"})
+
+    async def handle_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.exception("Unhandled Telegram application error", exc_info=context.error)
 
     async def _reply_text(self, update: Update, text: str, reply_markup=None) -> None:
         if update.message is None:
