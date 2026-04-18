@@ -23,7 +23,7 @@ from app.services.duplicate_detection_service import DuplicateDetectionService
 from app.services.target_resolution_service import TargetResolutionService
 from app.phase7 import EvaluatorAgent, SemanticConflictDetector
 from app.phase8 import MemoryProfileStore, MemoryReasoner
-from app.phase9 import MultiPlanConfirmationState, MultiReminderPlanner, ProactiveSuggester
+from app.phase9 import MultiPlanConfirmationState, MultiPlanItem, MultiReminderPlanner, ProactiveSuggester
 from app.phase9_1 import GeneralResponder, LLMConversationRouter, ThreadConversationState, ThreadMemoryStore
 from app.phase9_2 import ToolFirstRouter, ReferenceResolver, ReferenceContext, ReferenceMemoryStore, ChatReferenceState
 from app.phase9_3 import ConversationRepairAndClarifier
