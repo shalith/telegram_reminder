@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import time
+
+from telegram.error import Conflict
 
 from telegram import Update
 
@@ -41,7 +44,21 @@ def main() -> None:
     application = TelegramReminderBot(settings, reminder_scheduler, runtime_state).build()
 
     try:
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        conflict_attempt = 0
+        while True:
+            try:
+                application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+                break
+            except Conflict as exc:  # pragma: no cover
+                conflict_attempt += 1
+                runtime_state.record_error(str(exc))
+                wait_seconds = min(30, 5 * conflict_attempt)
+                logger.warning(
+                    "Polling conflict detected; another bot instance may still be running. Retrying.",
+                    extra={"event": "polling_conflict", "attempt": conflict_attempt, "wait_seconds": wait_seconds},
+                )
+                time.sleep(wait_seconds)
+                continue
     except Exception as exc:  # pragma: no cover
         runtime_state.record_error(str(exc))
         logger.exception("Application crashed", extra={"event": "app_crash"})

@@ -302,3 +302,7 @@ curl http://127.0.0.1:8088/health
 - For the easiest local run, delete the old `reminders.db` before starting because Phase 6 adds new tables and columns.
 - If `GROQ_API_KEY` is not set, the bot still works using the rule-based fallback interpreter.
 - Update/delete disambiguation now uses Telegram inline buttons with `resolve:<ai_run_id>:<reminder_id>` callback payloads.
+
+
+## Notes
+- On Railway, only one bot instance should poll Telegram at a time. This build retries automatically on short-lived polling conflicts during deploy overlap.
