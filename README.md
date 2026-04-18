@@ -1,3 +1,14 @@
+# Telegram Reminder MVP — Phase 6.5 Self-Learning
+
+This version adds self-learning from confirmations and corrections:
+- learns risky message patterns from cancelled/edited confirmations
+- learns successful phrasing from confirmed reminders
+- lowers confidence for phrases that were corrected before
+- raises confidence for similar phrases that were confirmed before
+- applies learned time-pattern rewrites before interpretation
+
+No new environment variables are required for this patch. New SQLite tables are created automatically on startup.
+
 # Telegram Reminder Bot — Phase 6.1 Conversation Maturity + Phase 6.2 Learning Loop
 
 This project is a local-machine Telegram reminder assistant with:

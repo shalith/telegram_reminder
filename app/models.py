@@ -159,6 +159,21 @@ class EvalCase(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class PhraseRiskScore(Base):
+    __tablename__ = "phrase_risk_scores"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    signature: Mapped[str] = mapped_column(String(255), index=True)
+    success_count: Mapped[int] = mapped_column(Integer, default=0)
+    confirmed_count: Mapped[int] = mapped_column(Integer, default=0)
+    correction_count: Mapped[int] = mapped_column(Integer, default=0)
+    risk_level: Mapped[float] = mapped_column(Float, default=0.0)
+    notes: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now(), onupdate=func.now())
+
+
 class InteractionFeedback(Base):
     __tablename__ = "interaction_feedback"
 
