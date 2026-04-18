@@ -23,7 +23,9 @@ class Settings:
     health_host: str = "127.0.0.1"
     health_port: int = 8088
     backup_dir: str = "./backups"
-    ai_min_auto_execute_confidence: float = 0.75
+    ai_min_auto_execute_confidence: float = 0.82
+    ai_confirmation_min_confidence: float = 0.45
+    ai_confirm_wakeups: bool = True
     ai_enable_eval_logging: bool = True
     ai_enable_resolution_buttons: bool = True
     otel_enabled: bool = False
@@ -63,7 +65,9 @@ class Settings:
             health_host=os.getenv("HEALTH_HOST", "127.0.0.1").strip() or "127.0.0.1",
             health_port=int(os.getenv("HEALTH_PORT", "8088")),
             backup_dir=os.getenv("BACKUP_DIR", "./backups").strip() or "./backups",
-            ai_min_auto_execute_confidence=float(os.getenv("AI_MIN_AUTO_EXECUTE_CONFIDENCE", "0.75")),
+            ai_min_auto_execute_confidence=float(os.getenv("AI_MIN_AUTO_EXECUTE_CONFIDENCE", "0.82")),
+            ai_confirmation_min_confidence=float(os.getenv("AI_CONFIRMATION_MIN_CONFIDENCE", "0.45")),
+            ai_confirm_wakeups=os.getenv("AI_CONFIRM_WAKEUPS", "true").strip().lower() not in {"0", "false", "no"},
             ai_enable_eval_logging=os.getenv("AI_ENABLE_EVAL_LOGGING", "true").strip().lower() not in {"0", "false", "no"},
             ai_enable_resolution_buttons=os.getenv("AI_ENABLE_RESOLUTION_BUTTONS", "true").strip().lower() not in {"0", "false", "no"},
             otel_enabled=os.getenv("OTEL_ENABLED", "false").strip().lower() in {"1", "true", "yes"},

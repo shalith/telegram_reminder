@@ -75,6 +75,16 @@ class InterpretationEnvelope(StrictBaseModel):
     deadline_offsets: list[DeadlineOffset] = Field(default_factory=list)
 
 
+class ConfirmationState(StrictBaseModel):
+    action: ActionName
+    envelope: InterpretationEnvelope
+    ai_run_id: int | None = None
+    confidence: float = Field(default=0.0, ge=0, le=1)
+    model_name: str | None = None
+    source_message_text: str | None = None
+    confirmation_reason: str | None = None
+
+
 class PendingConversationState(StrictBaseModel):
     action: ActionName
     reminder: ReminderDraft = Field(default_factory=ReminderDraft)

@@ -28,7 +28,7 @@ class ParseResult:
 
 
 REMIND_ME_PREFIX = re.compile(r"^\s*remind me\s+", re.IGNORECASE)
-WAKE_ME_UP_PREFIX = re.compile(r"^\s*wake me up\s+", re.IGNORECASE)
+WAKE_ME_UP_PREFIX = re.compile(r"^\s*(?:wake me up|wake up me|wake up)\s+", re.IGNORECASE)
 LEADING_EVERY_PREFIX = re.compile(r"^\s*(every\s+.+?|daily\s+at\s+.+?)\s+remind me\s+to\s+(.+)$", re.IGNORECASE)
 WEEKDAY_NAME_TO_INT = {
     "monday": 0,
@@ -60,6 +60,8 @@ def parse_reminder_text(text: str, timezone_name: str) -> ParseResult:
 
     if WAKE_ME_UP_PREFIX.match(normalized):
         remainder = WAKE_ME_UP_PREFIX.sub("", normalized, count=1).strip()
+        if remainder.lower().startswith("at "):
+            remainder = remainder[3:].strip()
         if not remainder:
             return ParseResult(ok=False, error="Please tell me when to wake you up.")
         return parse_schedule_components(

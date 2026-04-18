@@ -50,7 +50,7 @@ class TelegramReminderBot:
         application.add_handler(CommandHandler("today", self.today_command))
         application.add_handler(CommandHandler("prefs", self.prefs_command))
         application.add_handler(CommandHandler("delete", self.delete_command))
-        application.add_handler(CallbackQueryHandler(self.handle_callback_query, pattern=r"^(ack|snooze|resolve):"))
+        application.add_handler(CallbackQueryHandler(self.handle_callback_query, pattern=r"^(ack|snooze|resolve|confirm):"))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message))
         return application
 
@@ -151,6 +151,21 @@ class TelegramReminderBot:
                     session,
                     ai_run_id=ai_run_id,
                     reminder_id=reminder_id,
+                    chat_id=update.effective_chat.id,
+                    telegram_user_id=update.effective_user.id,
+                )
+            if query.message is not None:
+                await query.edit_message_reply_markup(reply_markup=None)
+                await query.message.reply_text(text)
+                self.runtime_state.record_outbound_message()
+            return
+
+        if action == "confirm":
+            choice = parts[1] if len(parts) >= 2 else ""
+            with get_session() as session:
+                text = self.interpretation_service.handle_confirmation_choice(
+                    session,
+                    choice=choice,
                     chat_id=update.effective_chat.id,
                     telegram_user_id=update.effective_user.id,
                 )

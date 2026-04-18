@@ -67,6 +67,9 @@ class RuleBasedInterpreter:
         if lower in {"help", "what can you do", "what do you support"}:
             return AgentDecision(intent="help")
 
+        if lower in {"thanks", "thank you", "thx", "ok", "okay", "hello", "hi", "hey"}:
+            return AgentDecision(intent="help" if lower in {"hello", "hi", "hey"} else "clarify", ask_user=("How can I assist you?" if lower in {"hello", "hi", "hey"} else "You're welcome."))
+
         if lower.startswith("/"):
             return AgentDecision(intent="unknown")
 
@@ -93,8 +96,12 @@ class RuleBasedInterpreter:
         if lower.startswith(("move ", "change ", "reschedule ", "update ")):
             return self._parse_update_intent(text)
 
-        if lower.startswith("wake me up"):
-            time_phrase = text[len("wake me up") :].strip(" .")
+        wake_variants = ["wake me up", "wake up me", "wake up"]
+        matched_wake = next((variant for variant in wake_variants if lower.startswith(variant)), None)
+        if matched_wake is not None:
+            time_phrase = text[len(matched_wake) :].strip(" .")
+            if time_phrase.lower().startswith("at "):
+                time_phrase = time_phrase[3:].strip()
             if not time_phrase:
                 return AgentDecision(
                     intent="create",
