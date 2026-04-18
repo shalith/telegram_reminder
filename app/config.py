@@ -33,6 +33,7 @@ class Settings:
     calendar_import_enabled: bool = True
     calendar_import_lead_minutes: int = 10
     calendar_import_fallback_to_today: bool = True
+    calendar_import_use_vision_llm: bool = True
     otel_enabled: bool = False
     otel_exporter_endpoint: str | None = None
 
@@ -80,6 +81,7 @@ class Settings:
             calendar_import_enabled=os.getenv("CALENDAR_IMPORT_ENABLED", "true").strip().lower() not in {"0", "false", "no"},
             calendar_import_lead_minutes=int(os.getenv("CALENDAR_IMPORT_LEAD_MINUTES", "10")),
             calendar_import_fallback_to_today=os.getenv("CALENDAR_IMPORT_FALLBACK_TO_TODAY", "true").strip().lower() not in {"0", "false", "no"},
+            calendar_import_use_vision_llm=os.getenv("CALENDAR_IMPORT_USE_VISION_LLM", "true").strip().lower() not in {"0", "false", "no"},
             otel_enabled=os.getenv("OTEL_ENABLED", "false").strip().lower() in {"1", "true", "yes"},
             otel_exporter_endpoint=os.getenv("OTEL_EXPORTER_ENDPOINT", "").strip() or None,
         )

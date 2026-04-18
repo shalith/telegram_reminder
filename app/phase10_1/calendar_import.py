@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import io
+import json
 import re
 from collections import deque
 from dataclasses import dataclass
@@ -8,6 +11,11 @@ from pathlib import Path
 
 import dateparser
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
+try:
+    from groq import Groq
+except Exception:  # pragma: no cover
+    Groq = None
 
 try:
     import pytesseract
@@ -123,13 +131,37 @@ class EventBox:
 
 
 class CalendarScreenshotImporter:
-    def __init__(self, *, default_timezone: str, lead_minutes: int = 10, fallback_to_today: bool = True):
+    def __init__(
+        self,
+        *,
+        default_timezone: str,
+        lead_minutes: int = 10,
+        fallback_to_today: bool = True,
+        groq_api_key: str | None = None,
+        groq_model: str | None = None,
+        use_vision_llm: bool = True,
+    ):
         self.default_timezone = default_timezone
         self.lead_minutes = lead_minutes
         self.fallback_to_today = fallback_to_today
+        self.groq_model = groq_model or 'meta-llama/llama-4-scout-17b-16e-instruct'
+        self.use_vision_llm = use_vision_llm
+        self._vision_client = Groq(api_key=groq_api_key) if (use_vision_llm and groq_api_key and Groq is not None) else None
 
     def import_from_image(self, image_path: str | Path, *, caption_text: str | None = None) -> CalendarImportProposal:
         base_image = self._load_image(image_path)
+        llm_meetings = self._extract_meetings_vision_llm(base_image=base_image, caption_text=caption_text)
+        if llm_meetings:
+            meetings = self._dedupe_meetings(llm_meetings, limit=8)
+            meetings = self._keep_best_per_slot(meetings)
+            if meetings:
+                return CalendarImportProposal(
+                    meetings=meetings,
+                    day_hint=self._extract_day_hint('', caption_text),
+                    lead_minutes=self.lead_minutes,
+                    raw_text='vision_llm',
+                )
+
         processed = self._prepare_for_ocr(base_image)
         raw_text = self._ocr_text(processed)
 
@@ -156,6 +188,134 @@ class CalendarScreenshotImporter:
             lead_minutes=self.lead_minutes,
             raw_text=raw_text,
         )
+
+
+    def _extract_meetings_vision_llm(self, *, base_image: Image.Image, caption_text: str | None) -> list[ImportedMeeting]:
+        if self._vision_client is None:
+            return []
+        try:
+            payload = self._call_vision_llm(base_image=base_image, caption_text=caption_text)
+        except Exception:
+            return []
+        if not isinstance(payload, dict):
+            return []
+        meetings_raw = payload.get('meetings')
+        if not isinstance(meetings_raw, list):
+            return []
+        meetings: list[ImportedMeeting] = []
+        for item in meetings_raw[:8]:
+            if not isinstance(item, dict):
+                continue
+            if item.get('cancelled') is True:
+                continue
+            title = str(item.get('title') or '').strip()
+            day_phrase = str(item.get('date_phrase') or '').strip()
+            time_phrase = str(item.get('start_time') or '').strip()
+            if not day_phrase or not time_phrase:
+                continue
+            resolved = self._parse_vision_datetime(day_phrase=day_phrase, time_phrase=time_phrase, caption_text=caption_text)
+            if resolved is None:
+                continue
+            if not title or len(title) < 3:
+                title = f"Meeting ({resolved.strftime('%a')})"
+            title = self._sanitize_meeting_title(title)
+            reminder_at = resolved - timedelta(minutes=self.lead_minutes)
+            meetings.append(
+                ImportedMeeting(
+                    title=title,
+                    meeting_start=resolved,
+                    reminder_at=reminder_at,
+                    reminder_time_phrase=reminder_at.strftime('%d %b %Y %I:%M %p'),
+                    source_line='vision_llm',
+                )
+            )
+        return self._keep_best_per_slot(self._dedupe_meetings(meetings, limit=8))
+
+    def _call_vision_llm(self, *, base_image: Image.Image, caption_text: str | None) -> dict | None:
+        buf = io.BytesIO()
+        image = base_image.copy()
+        image.thumbnail((1600, 1600))
+        image.save(buf, format='JPEG', quality=88)
+        b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+        prompt = (
+            "You are extracting meetings from a Microsoft Teams calendar screenshot. "
+            "Return ONLY valid JSON with shape {\"meetings\":[...]} where each meeting item has keys: "
+            "title, date_phrase, start_time, cancelled. "
+            "Use visible calendar structure: month/year header, day columns, left time axis, and blue meeting blocks. "
+            "Ignore navigation/search UI and do not invent meetings. "
+            "Prefer approximate but sensible start times from the visible grid, such as 8:30 AM or 9:30 AM. "
+            "If a title is partly visible, return the readable portion. If a meeting is marked canceled, set cancelled=true. "
+            "If uncertain, return fewer meetings, not more."
+        )
+        if caption_text:
+            prompt += f" Caption hint from user: {caption_text!r}."
+        response = self._vision_client.chat.completions.create(
+            model=self.groq_model,
+            temperature=0,
+            messages=[
+                {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': prompt},
+                        {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{b64}'}} ,
+                    ],
+                }
+            ],
+        )
+        content = (response.choices[0].message.content or '').strip()
+        if not content:
+            return None
+        content = self._extract_json_block(content)
+        try:
+            return json.loads(content)
+        except Exception:
+            return None
+
+    def _extract_json_block(self, text: str) -> str:
+        text = text.strip()
+        if text.startswith('```'):
+            text = re.sub(r'^```(?:json)?\s*', '', text)
+            text = re.sub(r'\s*```$', '', text)
+        start = text.find('{')
+        end = text.rfind('}')
+        if start >= 0 and end > start:
+            return text[start:end + 1]
+        return text
+
+    def _parse_vision_datetime(self, *, day_phrase: str, time_phrase: str, caption_text: str | None) -> datetime | None:
+        phrase = f"{day_phrase} {time_phrase}".strip()
+        dt = dateparser.parse(
+            phrase,
+            settings={
+                'TIMEZONE': self.default_timezone,
+                'RETURN_AS_TIMEZONE_AWARE': False,
+                'PREFER_DATES_FROM': 'future',
+                'RELATIVE_BASE': datetime.now(),
+            },
+        )
+        if dt is None and caption_text:
+            dt = dateparser.parse(
+                f"{caption_text} {time_phrase}",
+                settings={
+                    'TIMEZONE': self.default_timezone,
+                    'RETURN_AS_TIMEZONE_AWARE': False,
+                    'PREFER_DATES_FROM': 'future',
+                    'RELATIVE_BASE': datetime.now(),
+                },
+            )
+        if dt is None:
+            return None
+        if not (6 <= dt.hour <= 22):
+            return None
+        return dt.replace(second=0, microsecond=0)
+
+    def _sanitize_meeting_title(self, title: str) -> str:
+        title = re.sub(r'\s+', ' ', title).strip(' -–—:')
+        title = title.replace('Microsoft Teams Microsoft Teams', 'Microsoft Teams')
+        title = title[:80].strip()
+        if sum(ch.isalpha() for ch in title) < 3:
+            return 'Meeting'
+        return title
 
     def _load_image(self, image_path: str | Path) -> Image.Image:
         try:

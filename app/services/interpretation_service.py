@@ -115,6 +115,9 @@ class InterpretationService:
             default_timezone=settings.default_timezone,
             lead_minutes=settings.calendar_import_lead_minutes,
             fallback_to_today=settings.calendar_import_fallback_to_today,
+            groq_api_key=settings.groq_api_key,
+            groq_model=settings.groq_model,
+            use_vision_llm=settings.calendar_import_use_vision_llm,
         )
 
     def _looks_like_new_request(self, message_text: str) -> bool:
