@@ -38,6 +38,17 @@ class SelfLearningEngine:
         self.interactions = InteractionStore()
         self.feedback = FeedbackStore()
 
+    @staticmethod
+    def _ensure_row_defaults(row: PhraseRiskScore) -> None:
+        if row.success_count is None:
+            row.success_count = 0
+        if row.confirmed_count is None:
+            row.confirmed_count = 0
+        if row.correction_count is None:
+            row.correction_count = 0
+        if row.risk_level is None:
+            row.risk_level = 0.0
+
     def prepare(self, session, *, telegram_user_id: int, message_text: str, base_confidence: float = 0.0) -> LearningContext:
         prepared_message, applied = self._apply_learned_time_patterns(session, message_text)
         positive = self.corrections.positive_examples(session, telegram_user_id=telegram_user_id, message_text=prepared_message)
@@ -75,6 +86,7 @@ class SelfLearningEngine:
         if row is None:
             row = PhraseRiskScore(telegram_user_id=telegram_user_id, signature=signature)
             session.add(row)
+        self._ensure_row_defaults(row)
         if confirmed:
             row.confirmed_count += 1
             row.success_count += 1
@@ -88,6 +100,7 @@ class SelfLearningEngine:
         if row is None:
             row = PhraseRiskScore(telegram_user_id=telegram_user_id, signature=signature)
             session.add(row)
+        self._ensure_row_defaults(row)
         row.correction_count += 1
         if notes:
             row.notes = notes
@@ -99,6 +112,7 @@ class SelfLearningEngine:
         if row is None:
             row = PhraseRiskScore(telegram_user_id=telegram_user_id, signature=signature)
             session.add(row)
+        self._ensure_row_defaults(row)
         row.success_count += 1
         if notes:
             row.notes = notes
@@ -106,6 +120,7 @@ class SelfLearningEngine:
         session.commit()
 
     def _compute_risk(self, row: PhraseRiskScore) -> float:
+        self._ensure_row_defaults(row)
         total = max(1, row.success_count + row.confirmed_count + row.correction_count)
         risk = (row.correction_count * 1.5) / total
         if row.confirmed_count and row.correction_count == 0:

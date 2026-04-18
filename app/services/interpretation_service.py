@@ -690,7 +690,7 @@ class InterpretationService:
         if "learned_risk" in set(envelope.reasoning_tags):
             return "I've seen similar messages need correction before. Please confirm before I schedule it."
         task = envelope.reminder.task or "this reminder"
-        when = envelope.reminder.datetime_text or "that time"
+        when = normalize_time_phrase(envelope.reminder.datetime_text or "that time")
         if envelope.action == "create_reminder":
             if envelope.reminder.requires_ack or envelope.reminder.is_wake_up:
                 return f"I understood this as a wake-up reminder for {when}. Confirm before I schedule it?"

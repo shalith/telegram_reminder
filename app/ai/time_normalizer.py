@@ -28,6 +28,7 @@ def normalize_time_phrase(text: str) -> str:
     value = re.sub(r"\b(\d{1,2})(am|pm)\b", r"\1 \2", value, flags=re.IGNORECASE)
     value = re.sub(r"\bat\s+today\b", "today", value, flags=re.IGNORECASE)
     value = re.sub(r"\bat\s+tomorrow\b", "tomorrow", value, flags=re.IGNORECASE)
+    value = re.sub(r"\bat\s+at\b", "at", value, flags=re.IGNORECASE)
 
     def _period_repl(match: re.Match[str]) -> str:
         prefix = (match.group("prefix") or "").strip()
@@ -72,7 +73,7 @@ def normalize_time_phrase(text: str) -> str:
 
     # 10:30 morning / 8 evening / today 10:30 morning / tomorrow 7 night
     value = re.sub(
-        rf"(?P<prefix>(?:today|tomorrow|tonight|next\s+(?:{WEEKDAY_WORDS})|this\s+(?:{WEEKDAY_WORDS})|(?:\d{{1,2}})(?:st|nd|rd|th)?\s+(?:{MONTH_WORDS})(?:\s+\d{{4}})?))?\s*(?P<hour>\d{{1,2}})(?::(?P<minute>\d{{2}}))?\s+(?P<period>morning|afternoon|evening|night)\s*(?P<suffix>am|pm)?",
+        rf"(?P<prefix>(?:today|tomorrow|tonight|next\s+(?:{WEEKDAY_WORDS})|this\s+(?:{WEEKDAY_WORDS})|(?:\d{{1,2}})(?:st|nd|rd|th)?\s+(?:{MONTH_WORDS})(?:\s+\d{{4}})?))?\s*(?P<hour>\d{{1,2}})(?::(?P<minute>\d{{2}}))?\s+(?P<period>morning|afternoon|evening|night)\s*(?P<suffix>am|pm)?\b",
         _period_repl,
         value,
         flags=re.IGNORECASE,
