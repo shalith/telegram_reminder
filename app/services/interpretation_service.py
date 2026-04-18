@@ -22,6 +22,7 @@ from app.services.target_resolution_service import TargetResolutionService
 from app.phase7 import EvaluatorAgent, SemanticConflictDetector
 from app.phase8 import MemoryProfileStore, MemoryReasoner
 from app.phase9 import MultiPlanConfirmationState, MultiReminderPlanner, ProactiveSuggester
+from app.phase9_1 import GeneralResponder, LLMConversationRouter, ThreadConversationState, ThreadMemoryStore
 from app.tools.create_reminder import CreateReminderTool
 from app.tools.deadline_chain import DeadlineChainTool
 from app.tools.delete_reminder import DeleteReminderTool
@@ -97,6 +98,9 @@ class InterpretationService:
         self.memory_reasoner = MemoryReasoner()
         self.multi_planner = MultiReminderPlanner()
         self.proactive_suggester = ProactiveSuggester()
+        self.thread_memory = ThreadMemoryStore()
+        self.conversation_router = LLMConversationRouter(settings)
+        self.general_responder = GeneralResponder(settings)
 
     def _looks_like_new_request(self, message_text: str) -> bool:
         lowered = (message_text or '').strip().lower()
@@ -166,22 +170,22 @@ class InterpretationService:
     def handle_user_message(self, session, *, chat_id: int, telegram_user_id: int, message_text: str) -> BotResponsePlan:
         cleaned = " ".join((message_text or "").strip().split())
         lowered = cleaned.lower()
-        smalltalk = {
-            "thanks": "You're welcome.",
-            "thank you": "You're welcome.",
-            "thx": "You're welcome.",
-            "ok": "Okay.",
-            "okay": "Okay.",
-            "hello": "How can I assist you?",
-            "hi": "How can I assist you?",
-            "hey": "How can I assist you?",
-        }
-        if lowered in smalltalk:
-            return BotResponsePlan(text=smalltalk[lowered])
 
         plan_state = self._get_multi_plan_state(session, chat_id=chat_id)
+        pending_state = self._get_pending_state(session, chat_id=chat_id)
+        confirmation_state = self._get_confirmation_state(session, chat_id=chat_id)
+        thread_state = self._get_thread_state(session, chat_id=chat_id)
+
+        route = self.conversation_router.route(
+            message_text=cleaned,
+            has_active_thread=any([plan_state is not None, pending_state is not None, confirmation_state is not None, thread_state is not None]),
+            has_pending_confirmation=plan_state is not None or confirmation_state is not None,
+            has_pending_follow_up=pending_state is not None,
+        )
+
         if plan_state is not None:
-            if lowered in {"yes", "y", "confirm", "confirm it"}:
+            if lowered in {"yes", "y", "confirm", "confirm it", "ok", "okay"} or route.route == 'confirmation_reply':
+                self._clear_thread_state(session, chat_id=chat_id)
                 return self._execute_multi_plan_state(
                     session,
                     state=plan_state,
@@ -190,6 +194,7 @@ class InterpretationService:
                 )
             if lowered in {"no", "n", "cancel", "stop"}:
                 self._clear_multi_plan_state(session, chat_id=chat_id)
+                self._clear_thread_state(session, chat_id=chat_id)
                 return BotResponsePlan(text="Okay — I cancelled that multi-reminder plan.")
             if self._looks_like_new_request(cleaned):
                 self._clear_multi_plan_state(session, chat_id=chat_id)
@@ -202,8 +207,10 @@ class InterpretationService:
             timezone_name=self.settings.default_timezone,
         )
         open_reminders = self.reminder_service.list_open_reminders(session, chat_id=chat_id)
-        pending_state = self._get_pending_state(session, chat_id=chat_id)
-        confirmation_state = self._get_confirmation_state(session, chat_id=chat_id)
+
+        if route.route == 'general_chat' and plan_state is None and pending_state is None and confirmation_state is None and not self._looks_like_new_request(cleaned):
+            self._clear_thread_state(session, chat_id=chat_id)
+            return BotResponsePlan(text=self.general_responder.respond(message_text=message_text))
 
         if pending_state is not None and self._looks_like_new_request(cleaned):
             self._clear_pending_state(session, chat_id=chat_id)
@@ -212,6 +219,22 @@ class InterpretationService:
         if confirmation_state is not None and self._looks_like_new_request(cleaned):
             self._clear_confirmation_state(session, chat_id=chat_id)
             confirmation_state = None
+
+        if route.route in {'reminder_conversation', 'repair_conversation'} and plan_state is None and pending_state is None and confirmation_state is None:
+            self._save_thread_state(
+                session,
+                chat_id=chat_id,
+                telegram_user_id=telegram_user_id,
+                state=ThreadConversationState(
+                    mode=route.route,
+                    status='active',
+                    turns=(thread_state.turns + 1) if thread_state is not None else 1,
+                    draft_action=None,
+                    draft_summary=None,
+                    last_bot_prompt=None,
+                    last_user_message=message_text,
+                ),
+            )
 
         multi_plan = self.multi_planner.detect(prepared_message_text if "prepared_message_text" in locals() else cleaned, timezone_name=pref.timezone)
         if multi_plan is not None:
@@ -238,7 +261,7 @@ class InterpretationService:
         prepared_message_text = learning_context.prepared_message
 
         if confirmation_state is not None:
-            if lowered in {"yes", "y", "confirm", "confirm it"}:
+            if lowered in {"yes", "y", "confirm", "confirm it", "ok", "okay"} or route.route == "confirmation_reply":
                 return self._execute_confirmation_state(
                     session,
                     confirmation_state=confirmation_state,
@@ -251,6 +274,7 @@ class InterpretationService:
                 signature = self.self_learning.build_signature(confirmation_state.source_message_text or message_text)
                 self.self_learning.record_correction(session, telegram_user_id=telegram_user_id, signature=signature, notes="user_cancelled_confirmation")
                 self._clear_confirmation_state(session, chat_id=chat_id)
+                self._clear_thread_state(session, chat_id=chat_id)
                 return BotResponsePlan(text="Okay — I cancelled that pending action.")
 
         repair_plan = self._try_repair_conversation(
@@ -513,6 +537,7 @@ class InterpretationService:
                 notes="button_cancelled_confirmation",
             )
             self._clear_confirmation_state(session, chat_id=chat_id)
+            self._clear_thread_state(session, chat_id=chat_id)
             return "Okay — I cancelled that pending action."
         if choice == "edit":
             self.self_learning.record_correction(
@@ -546,6 +571,7 @@ class InterpretationService:
             notes=confirmation_state.confirmation_reason or "confirmed",
         )
         self._clear_confirmation_state(session, chat_id=chat_id)
+        self._clear_thread_state(session, chat_id=chat_id)
         interpreter_result = InterpreterResult(
             envelope=confirmation_state.envelope,
             raw_response_text=None,
@@ -584,6 +610,7 @@ class InterpretationService:
         was_confirmed: bool = False,
         ai_run_id: int | None = None,
     ) -> BotResponsePlan:
+        self._clear_thread_state(session, chat_id=chat_id)
         if envelope.action == "help":
             return BotResponsePlan(
                 text=(
@@ -661,10 +688,12 @@ class InterpretationService:
                 task=envelope.reminder.task or "",
                 due_repr=envelope.reminder.datetime_text or "",
                 recurrence=envelope.reminder.recurrence_text,
+                timezone_name=pref.timezone,
             )
-            if duplicates:
+            if duplicates and not was_confirmed:
                 self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=original_message_text, phase="create", outcome="duplicate_block")
-                return BotResponsePlan(text="That looks similar to an existing reminder. Say it again with a clearer time, or use /list to check first.")
+                dup = duplicates[0]
+                return BotResponsePlan(text=f"This looks very similar to reminder #{dup.id}: {dup.task}. Confirm first, or use /list to review your reminders.")
             reminder, status = self.create_tool.execute(
                 session,
                 scheduler=self.scheduler,
@@ -897,11 +926,21 @@ class InterpretationService:
             else:
                 lines.append(f"• Could not create '{item.task}' — {status}")
         self._clear_multi_plan_state(session, chat_id=chat_id)
+        self._clear_thread_state(session, chat_id=chat_id)
         suggestions = self.proactive_suggester.suggestions_after_create(session, chat_id=chat_id, created_reminders=created, open_reminders=open_reminders)
         text = "Done — here is your plan:\n" + "\n".join(lines) if lines else "I couldn't create that plan."
         if suggestions:
             text += "\n\nSuggestion: " + suggestions[0]
         return BotResponsePlan(text=text)
+
+    def _get_thread_state(self, session, *, chat_id: int) -> ThreadConversationState | None:
+        return self.thread_memory.get(session, chat_id=chat_id)
+
+    def _save_thread_state(self, session, *, chat_id: int, telegram_user_id: int, state: ThreadConversationState) -> None:
+        self.thread_memory.save(session, chat_id=chat_id, telegram_user_id=telegram_user_id, state=state)
+
+    def _clear_thread_state(self, session, *, chat_id: int) -> None:
+        self.thread_memory.clear(session, chat_id=chat_id)
 
     def _save_pending_state(self, session, *, chat_id: int, telegram_user_id: int, state: PendingConversationState) -> None:
         stmt = select(ConversationState).where(ConversationState.chat_id == chat_id)
