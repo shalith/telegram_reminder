@@ -120,14 +120,18 @@ class TelegramReminderBot:
             return
         incoming_text = update.message.text or ""
         self.runtime_state.record_inbound_message()
-        with get_session() as session:
-            plan = self.interpretation_service.handle_user_message(
-                session,
-                chat_id=update.effective_chat.id,
-                telegram_user_id=update.effective_user.id,
-                message_text=incoming_text,
-            )
-        await self._reply_text(update, plan.text, reply_markup=plan.reply_markup)
+        try:
+            with get_session() as session:
+                plan = self.interpretation_service.handle_user_message(
+                    session,
+                    chat_id=update.effective_chat.id,
+                    telegram_user_id=update.effective_user.id,
+                    message_text=incoming_text,
+                )
+            await self._reply_text(update, plan.text, reply_markup=plan.reply_markup)
+        except Exception:
+            logger.exception('Text message handling failed', extra={'event': 'text_message_failed'})
+            await self._reply_text(update, 'Sorry — that request failed unexpectedly. Please try again with a fresh message.')
 
 
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

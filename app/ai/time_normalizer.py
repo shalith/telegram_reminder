@@ -68,6 +68,15 @@ def normalize_time_phrase(text: str) -> str:
         flags=re.IGNORECASE,
     )
 
+
+
+    # 10:30 morning / 8 evening / today 10:30 morning / tomorrow 7 night
+    value = re.sub(
+        rf"(?P<prefix>(?:today|tomorrow|tonight|next\s+(?:{WEEKDAY_WORDS})|this\s+(?:{WEEKDAY_WORDS})|(?:\d{{1,2}})(?:st|nd|rd|th)?\s+(?:{MONTH_WORDS})(?:\s+\d{{4}})?))?\s*(?P<hour>\d{{1,2}})(?::(?P<minute>\d{{2}}))?\s+(?P<period>morning|afternoon|evening|night)\s*(?P<suffix>am|pm)?",
+        _period_repl,
+        value,
+        flags=re.IGNORECASE,
+    )
     # today morning / tomorrow evening with no hour -> keep as a richer phrase but add a default cue
     value = re.sub(r"\btoday morning\b", "today at 9 AM", value, flags=re.IGNORECASE)
     value = re.sub(r"\btomorrow morning\b", "tomorrow at 9 AM", value, flags=re.IGNORECASE)

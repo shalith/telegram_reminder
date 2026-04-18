@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 from sqlalchemy import select
@@ -88,6 +89,71 @@ class InterpretationService:
         self.deadline_tool = DeadlineChainTool(self.reminder_service)
         self.missed_tool = MissedSummaryTool(self.reminder_service)
 
+    def _looks_like_new_request(self, message_text: str) -> bool:
+        lowered = (message_text or '').strip().lower()
+        prefixes = (
+            'remind me',
+            'wake me up',
+            'wake up me',
+            'wake up',
+            'move ',
+            'change ',
+            'reschedule ',
+            'update ',
+            'delete ',
+            'cancel ',
+            'remove ',
+            '/list',
+            '/today',
+            '/prefs',
+            '/delete',
+            'show my reminders',
+            'list my reminders',
+            'what are my reminders',
+            'what do i have today',
+            "what's on today",
+            'today agenda',
+            'what did i miss',
+            'send my daily agenda',
+            'set my ',
+        )
+        return lowered.startswith(prefixes)
+
+    def _extract_wake_time_phrase(self, message_text: str) -> str | None:
+        normalized = ' '.join((message_text or '').strip().split())
+        match = re.match(r'^\s*(?:wake me up|wake up me|wake up)\b\s*(.*)$', normalized, re.IGNORECASE)
+        if not match:
+            return None
+        remainder = (match.group(1) or '').strip(' .')
+        if remainder.lower().startswith('at '):
+            remainder = remainder[3:].strip()
+        return normalize_time_phrase(remainder) if remainder else None
+
+    def _build_wake_up_envelope(self, message_text: str) -> InterpretationEnvelope | None:
+        if self._extract_wake_time_phrase(message_text) is None and not re.match(r'^\s*(?:wake me up|wake up me|wake up)\b', message_text or '', re.IGNORECASE):
+            return None
+        time_phrase = self._extract_wake_time_phrase(message_text)
+        follow_up = FollowUp(needed=time_phrase is None, question='What time should I wake you up?' if time_phrase is None else None, missing_fields=['time_phrase'] if time_phrase is None else [])
+        return InterpretationEnvelope(
+            action='create_reminder',
+            confidence=0.9 if time_phrase else 0.82,
+            reminder=ReminderDraft(
+                task='wake up',
+                datetime_text=time_phrase,
+                recurrence_text=time_phrase,
+                timezone=None,
+                is_wake_up=True,
+                requires_ack=True,
+                priority='high',
+            ),
+            target=TargetSelector(),
+            preferences=PreferencePatch(),
+            follow_up=follow_up,
+            user_message_summary='wake_up_fastpath',
+            reasoning_tags=['wake_up_fastpath'],
+            deadline_offsets=[],
+        )
+
     def handle_user_message(self, session, *, chat_id: int, telegram_user_id: int, message_text: str) -> BotResponsePlan:
         cleaned = " ".join((message_text or "").strip().split())
         lowered = cleaned.lower()
@@ -113,6 +179,15 @@ class InterpretationService:
         open_reminders = self.reminder_service.list_open_reminders(session, chat_id=chat_id)
         pending_state = self._get_pending_state(session, chat_id=chat_id)
         confirmation_state = self._get_confirmation_state(session, chat_id=chat_id)
+
+        if pending_state is not None and self._looks_like_new_request(cleaned):
+            self._clear_pending_state(session, chat_id=chat_id)
+            pending_state = None
+
+        if confirmation_state is not None and self._looks_like_new_request(cleaned):
+            self._clear_confirmation_state(session, chat_id=chat_id)
+            confirmation_state = None
+
         learning_context = self.self_learning.prepare(
             session,
             telegram_user_id=telegram_user_id,
@@ -155,14 +230,24 @@ class InterpretationService:
                 learned_examples.append(
                     f"risky_user='{item.example.source_text}' | action={item.example.action_name} | task='{item.example.resolved_task or ''}' | time='{item.example.resolved_time_phrase or ''}'"
                 )
-        interpreter_result = self.interpreter.interpret(
-            message_text=prepared_message_text,
-            timezone_name=pref.timezone,
-            pending_state=pending_state,
-            open_reminders=open_reminders,
-            preference_snapshot=self.reminder_service.format_preferences_summary(pref),
-            learned_examples=learned_examples,
-        )
+        fastpath_wake = self._build_wake_up_envelope(prepared_message_text)
+        if fastpath_wake is not None:
+            interpreter_result = InterpreterResult(
+                envelope=fastpath_wake,
+                raw_response_text=None,
+                model_name='wake-up-fastpath',
+                validation_ok=True,
+                error_message=None,
+            )
+        else:
+            interpreter_result = self.interpreter.interpret(
+                message_text=prepared_message_text,
+                timezone_name=pref.timezone,
+                pending_state=pending_state,
+                open_reminders=open_reminders,
+                preference_snapshot=self.reminder_service.format_preferences_summary(pref),
+                learned_examples=learned_examples,
+            )
         envelope = interpreter_result.envelope
         if pending_state is not None and envelope.action == "clarify":
             envelope = self._merge_pending_state(pending_state, prepared_message_text)
