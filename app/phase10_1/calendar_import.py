@@ -36,6 +36,9 @@ class ImportedMeeting:
     reminder_at: datetime
     reminder_time_phrase: str
     source_line: str
+    confidence: float = 0.7
+    confidence_tier: str = 'high'
+    cancelled: bool = False
 
 
 @dataclass(slots=True)
@@ -46,13 +49,23 @@ class CalendarImportProposal:
     raw_text: str
 
     def confirmation_text(self) -> str:
-        lines = [
-            f"I found {len(self.meetings)} likely meeting(s) in your screenshot. Confirm and I will create reminders {self.lead_minutes} minute(s) before each:"
-        ]
+        high = [m for m in self.meetings if m.confidence_tier == "high"]
+        likely = [m for m in self.meetings if m.confidence_tier != "high"]
+        if likely:
+            header = (
+                f"I found {len(self.meetings)} meeting(s) in your screenshot "
+                f"({len(high)} high-confidence, {len(likely)} likely). Confirm and I will create reminders {self.lead_minutes} minute(s) before each:"
+            )
+        else:
+            header = f"I found {len(self.meetings)} likely meeting(s) in your screenshot. Confirm and I will create reminders {self.lead_minutes} minute(s) before each:"
+        lines = [header]
         for meeting in self.meetings:
             start_label = meeting.meeting_start.strftime("%d %b %Y %I:%M %p")
             remind_label = meeting.reminder_at.strftime("%d %b %Y %I:%M %p")
-            lines.append(f"• {meeting.title} — meeting at {start_label}, reminder at {remind_label}")
+            label = f"• {meeting.title} — meeting at {start_label}, reminder at {remind_label}"
+            if meeting.confidence_tier != "high":
+                label = f"• [likely] {meeting.title} — meeting at {start_label}, reminder at {remind_label}"
+            lines.append(label)
         lines.append("Reply yes to create them, or no to cancel.")
         return "\n".join(lines)
 
@@ -203,12 +216,12 @@ class CalendarScreenshotImporter:
         if not isinstance(meetings_raw, list):
             return []
         meetings: list[ImportedMeeting] = []
-        for item in meetings_raw[:8]:
+        for item in meetings_raw[:12]:
             if not isinstance(item, dict):
                 continue
-            if item.get('cancelled') is True:
-                continue
             title = str(item.get('title') or '').strip()
+            if item.get('cancelled') is True or self._is_cancelled_title(title):
+                continue
             day_phrase = str(item.get('date_phrase') or '').strip()
             time_phrase = str(item.get('start_time') or '').strip()
             if not day_phrase or not time_phrase:
@@ -220,6 +233,9 @@ class CalendarScreenshotImporter:
                 title = f"Meeting ({resolved.strftime('%a')})"
             title = self._sanitize_meeting_title(title)
             reminder_at = resolved - timedelta(minutes=self.lead_minutes)
+            tier = str(item.get('confidence_tier') or '').strip().lower()
+            if tier not in {'high', 'likely'}:
+                tier = 'high' if len(title) >= 8 else 'likely'
             meetings.append(
                 ImportedMeeting(
                     title=title,
@@ -227,9 +243,11 @@ class CalendarScreenshotImporter:
                     reminder_at=reminder_at,
                     reminder_time_phrase=reminder_at.strftime('%d %b %Y %I:%M %p'),
                     source_line='vision_llm',
+                    confidence=0.82 if tier == 'high' else 0.62,
+                    confidence_tier=tier,
                 )
             )
-        return self._keep_best_per_slot(self._dedupe_meetings(meetings, limit=8))
+        return self._keep_best_per_slot(self._dedupe_meetings(meetings, limit=12))
 
     def _call_vision_llm(self, *, base_image: Image.Image, caption_text: str | None) -> dict | None:
         buf = io.BytesIO()
@@ -240,11 +258,11 @@ class CalendarScreenshotImporter:
         prompt = (
             "You are extracting meetings from a Microsoft Teams calendar screenshot. "
             "Return ONLY valid JSON with shape {\"meetings\":[...]} where each meeting item has keys: "
-            "title, date_phrase, start_time, cancelled. "
+            "title, date_phrase, start_time, cancelled, confidence_tier. "
             "Use visible calendar structure: month/year header, day columns, left time axis, and blue meeting blocks. "
             "Ignore navigation/search UI and do not invent meetings. "
-            "Prefer approximate but sensible start times from the visible grid, such as 8:30 AM or 9:30 AM. "
-            "If a title is partly visible, return the readable portion. If a meeting is marked canceled, set cancelled=true. "
+            "Prefer approximate but sensible start times from the visible grid, especially half-hour starts such as 8:30 AM or 9:30 AM when blocks begin midway between hour lines. "
+            "If a title is partly visible, return the readable portion. If a meeting is marked canceled/cancelled/annulé, set cancelled=true. Also return confidence_tier as either high or likely. "
             "If uncertain, return fewer meetings, not more."
         )
         if caption_text:
@@ -421,7 +439,7 @@ class CalendarScreenshotImporter:
         boxes = self._merge_duplicate_boxes(boxes)
         meetings: list[ImportedMeeting] = []
         for box in boxes:
-            if box.width < width * 0.06 or box.height < height * 0.012:
+            if box.width < width * 0.035 or box.height < height * 0.009:
                 continue
             column = self._assign_day_column(box, columns)
             if column is None:
@@ -431,6 +449,8 @@ class CalendarScreenshotImporter:
                 continue
 
             title, title_quality = self._extract_title_for_box(words, box)
+            if self._is_cancelled_title(title):
+                continue
             if title_quality < 0.28:
                 title = self._generic_title_from_box(column.label, start_dt)
             reminder_at = start_dt - timedelta(minutes=self.lead_minutes)
@@ -441,10 +461,13 @@ class CalendarScreenshotImporter:
                 reminder_time_phrase=reminder_at.strftime("%d %b %Y %I:%M %p"),
                 source_line=f"vision:{column.label}:{title}",
             )
-            if self._meeting_quality(candidate, title_quality=title_quality, box=box, time_rows=time_rows) >= 0.45:
+            quality = self._meeting_quality(candidate, title_quality=title_quality, box=box, time_rows=time_rows)
+            if quality >= 0.38:
+                candidate.confidence = quality
+                candidate.confidence_tier = 'high' if quality >= 0.68 else 'likely'
                 meetings.append(candidate)
 
-        meetings = self._dedupe_meetings(meetings, limit=8)
+        meetings = self._dedupe_meetings(meetings, limit=12)
         return self._keep_best_per_slot(meetings)
 
     def _ocr_words(self, image: Image.Image) -> list[OcrWord]:
@@ -622,7 +645,7 @@ class CalendarScreenshotImporter:
 
         visited = [[False] * w for _ in range(h)]
         boxes: list[EventBox] = []
-        min_area = max(60, int(w * h * 0.00014))
+        min_area = max(40, int(w * h * 0.00009))
         for y in range(max(0, t), min(h, b)):
             for x in range(max(0, l), min(w, r)):
                 if not mask[y][x] or visited[y][x]:
@@ -645,9 +668,9 @@ class CalendarScreenshotImporter:
                             q.append((nx, ny))
                 bw = max_x - min_x + 1
                 bh = max_y - min_y + 1
-                if area < min_area or bw < 40 or bh < 12:
+                if area < min_area or bw < 28 or bh < 10:
                     continue
-                if bh > 95 or bw < bh * 2.2:
+                if bh > 120 or bw < bh * 1.5:
                     continue
                 left = int(min_x / scale)
                 right = int((max_x + 1) / scale)
@@ -674,9 +697,9 @@ class CalendarScreenshotImporter:
         return merged
 
     def _should_merge_boxes(self, a: EventBox, b: EventBox) -> bool:
-        same_row = abs(a.top - b.top) < 12 and abs(a.bottom - b.bottom) < 12
-        touching = b.left - a.right < 18
-        overlap = not (b.top > a.bottom or b.bottom < a.top)
+        same_row = abs(a.top - b.top) < 16 and abs(a.bottom - b.bottom) < 16
+        touching = b.left - a.right < 24
+        overlap = not (b.top > a.bottom + 6 or b.bottom < a.top - 6)
         return same_row and touching and overlap
 
     def _assign_day_column(self, box: EventBox, columns: list[DayColumn]) -> DayColumn | None:
@@ -691,14 +714,32 @@ class CalendarScreenshotImporter:
         if len(time_rows) < 2:
             return None
         time_rows = sorted(time_rows, key=lambda r: r.y)
-        row_step = self._average_row_step(time_rows)
-        nearest_idx = min(range(len(time_rows)), key=lambda i: abs(time_rows[i].y - box.cy))
-        base_row = time_rows[nearest_idx]
-        if box.top < base_row.y and nearest_idx > 0 and (base_row.y - box.top) > row_step * 0.35:
-            base_row = time_rows[nearest_idx - 1]
-        offset_ratio = max(0.0, min(1.0, (box.top - base_row.y) / max(1.0, row_step)))
-        minutes = 0 if offset_ratio < 0.28 else 30
-        phrase = f"{day_phrase} {self._format_hour(base_row.hour_24, minutes)}"
+        start_anchor = None
+        next_anchor = None
+        for idx in range(len(time_rows) - 1):
+            current = time_rows[idx]
+            nxt = time_rows[idx + 1]
+            if current.y <= box.top <= nxt.y:
+                start_anchor = current
+                next_anchor = nxt
+                break
+        if start_anchor is None:
+            # fall back to nearest row by top edge, not center, which over-snaps to full hours
+            nearest_idx = min(range(len(time_rows)), key=lambda i: abs(time_rows[i].y - box.top))
+            start_anchor = time_rows[nearest_idx]
+            next_anchor = time_rows[min(nearest_idx + 1, len(time_rows) - 1)] if nearest_idx + 1 < len(time_rows) else None
+
+        minutes = 0
+        if next_anchor is not None and next_anchor.y > start_anchor.y:
+            interval = max(1.0, next_anchor.y - start_anchor.y)
+            ratio = max(0.0, min(1.2, (box.top - start_anchor.y) / interval))
+            if ratio >= 0.75:
+                # very close to next hour line
+                start_anchor = next_anchor
+                minutes = 0
+            elif ratio >= 0.38:
+                minutes = 30
+        phrase = f"{day_phrase} {self._format_hour(start_anchor.hour_24, minutes)}"
         dt = dateparser.parse(
             phrase,
             settings={
@@ -888,8 +929,12 @@ class CalendarScreenshotImporter:
         if box is not None:
             if box.width >= 120:
                 score += 0.08
+            elif box.width >= 70:
+                score += 0.04
             if box.height >= 16:
                 score += 0.05
+            elif box.height >= 10:
+                score += 0.02
         if time_rows is not None and len(time_rows) >= 2:
             nearest = min(abs(row.y - (box.top if box else row.y)) for row in time_rows)
             if nearest < 35:
@@ -914,17 +959,21 @@ class CalendarScreenshotImporter:
                 re.sub(r"\s+", " ", meeting.title.lower()).strip(),
             )
             current = bucketed.get(bucket)
-            if current is None or len(meeting.title) > len(current.title):
+            if current is None or meeting.confidence > current.confidence or len(meeting.title) > len(current.title):
                 bucketed[bucket] = meeting
         result = sorted(bucketed.values(), key=lambda m: m.meeting_start)
-        # If many vague generic meetings remain, collapse by 30-minute slot to keep only one per slot.
         collapsed: dict[str, ImportedMeeting] = {}
         for meeting in result:
             slot = meeting.meeting_start.strftime("%Y-%m-%d %H:%M")
             current = collapsed.get(slot)
-            if current is None or self._title_quality(meeting.title) > self._title_quality(current.title):
+            if current is None or meeting.confidence > current.confidence or self._title_quality(meeting.title) > self._title_quality(current.title):
                 collapsed[slot] = meeting
-        return sorted(collapsed.values(), key=lambda m: m.meeting_start)[:6]
+        high = [m for m in collapsed.values() if m.confidence_tier == 'high']
+        likely = [m for m in collapsed.values() if m.confidence_tier != 'high']
+        high = sorted(high, key=lambda m: m.meeting_start)[:10]
+        remaining = max(0, 12 - len(high))
+        likely = sorted(likely, key=lambda m: (m.meeting_start, -m.confidence))[:remaining]
+        return sorted(high + likely, key=lambda m: m.meeting_start)
 
     def _dedupe_meetings(self, meetings: list[ImportedMeeting], *, limit: int = 12) -> list[ImportedMeeting]:
         deduped: list[ImportedMeeting] = []
