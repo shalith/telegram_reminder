@@ -30,6 +30,9 @@ class Settings:
     ai_enable_resolution_buttons: bool = True
     ai_memory_enabled: bool = True
     ai_memory_max_profiles: int = 3
+    calendar_import_enabled: bool = True
+    calendar_import_lead_minutes: int = 10
+    calendar_import_fallback_to_today: bool = True
     otel_enabled: bool = False
     otel_exporter_endpoint: str | None = None
 
@@ -74,6 +77,9 @@ class Settings:
             ai_enable_resolution_buttons=os.getenv("AI_ENABLE_RESOLUTION_BUTTONS", "true").strip().lower() not in {"0", "false", "no"},
             ai_memory_enabled=os.getenv("AI_MEMORY_ENABLED", "true").strip().lower() not in {"0", "false", "no"},
             ai_memory_max_profiles=int(os.getenv("AI_MEMORY_MAX_PROFILES", "3")),
+            calendar_import_enabled=os.getenv("CALENDAR_IMPORT_ENABLED", "true").strip().lower() not in {"0", "false", "no"},
+            calendar_import_lead_minutes=int(os.getenv("CALENDAR_IMPORT_LEAD_MINUTES", "10")),
+            calendar_import_fallback_to_today=os.getenv("CALENDAR_IMPORT_FALLBACK_TO_TODAY", "true").strip().lower() not in {"0", "false", "no"},
             otel_enabled=os.getenv("OTEL_ENABLED", "false").strip().lower() in {"1", "true", "yes"},
             otel_exporter_endpoint=os.getenv("OTEL_EXPORTER_ENDPOINT", "").strip() or None,
         )

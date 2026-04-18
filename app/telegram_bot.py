@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
+import os
+import tempfile
 
 from telegram import Update
 from telegram.error import TelegramError
@@ -27,6 +29,7 @@ HELP_TEXT = """Try these examples:
 • What do I have today
 • Set my snooze to 10 minutes
 • My report deadline is April 30 at 5 PM, remind me 7 days before and 2 hours before
+• Send a Teams calendar screenshot and I can propose meeting reminders
 
 Commands:
 /list - show your open reminders
@@ -54,6 +57,7 @@ class TelegramReminderBot:
         application.add_handler(CommandHandler("prefs", self.prefs_command))
         application.add_handler(CommandHandler("delete", self.delete_command))
         application.add_handler(CallbackQueryHandler(self.handle_callback_query, pattern=r"^(ack|snooze|resolve|confirm):"))
+        application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, self.handle_photo_message))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message))
         application.add_error_handler(self.handle_error)
         return application
@@ -116,6 +120,54 @@ class TelegramReminderBot:
                 message_text=f"cancel reminder #{raw_id}",
             )
         await self._reply_text(update, plan.text, reply_markup=plan.reply_markup)
+
+
+
+    async def handle_photo_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_chat is None or update.effective_user is None:
+            return
+        message = update.message
+        if message is None:
+            return
+        self.runtime_state.record_inbound_message()
+        caption = message.caption or ''
+        tmp_path = None
+        try:
+            telegram_file = None
+            suffix = '.jpg'
+            if message.photo:
+                telegram_file = await message.photo[-1].get_file()
+                suffix = '.jpg'
+            elif message.document and (message.document.mime_type or '').startswith('image/'):
+                telegram_file = await message.document.get_file()
+                filename = message.document.file_name or ''
+                if '.' in filename:
+                    suffix = os.path.splitext(filename)[1] or suffix
+            if telegram_file is None:
+                await self._reply_text(update, 'Please send a Teams calendar screenshot as an image.')
+                return
+            with tempfile.NamedTemporaryFile(prefix='calendar_import_', suffix=suffix, delete=False) as tmp:
+                tmp_path = tmp.name
+            await telegram_file.download_to_drive(custom_path=tmp_path)
+            with get_session() as session:
+                plan = self.interpretation_service.handle_calendar_screenshot_import(
+                    session,
+                    chat_id=update.effective_chat.id,
+                    telegram_user_id=update.effective_user.id,
+                    image_path=tmp_path,
+                    caption_text=caption,
+                )
+            await self._reply_text(update, plan.text, reply_markup=plan.reply_markup)
+        except Exception as exc:
+            self.runtime_state.record_error(str(exc))
+            logger.exception('Calendar screenshot import failed', extra={'event': 'calendar_screenshot_import_failed'})
+            await self._reply_text(update, 'Sorry — I could not import meetings from that screenshot. Send a clearer Teams calendar screenshot, or add a caption like "tomorrow".')
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message is None or update.effective_chat is None or update.effective_user is None:

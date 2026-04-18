@@ -27,6 +27,7 @@ from app.phase9 import MultiPlanConfirmationState, MultiReminderPlanner, Proacti
 from app.phase9_1 import GeneralResponder, LLMConversationRouter, ThreadConversationState, ThreadMemoryStore
 from app.phase9_2 import ToolFirstRouter, ReferenceResolver, ReferenceContext, ReferenceMemoryStore, ChatReferenceState
 from app.phase9_3 import ConversationRepairAndClarifier
+from app.phase10_1 import CalendarScreenshotImporter, CalendarImportError
 from app.tools.create_reminder import CreateReminderTool
 from app.tools.deadline_chain import DeadlineChainTool
 from app.tools.delete_reminder import DeleteReminderTool
@@ -110,6 +111,11 @@ class InterpretationService:
         self.reference_resolver = ReferenceResolver()
         self.reference_memory = ReferenceMemoryStore()
         self.repair_clarifier = ConversationRepairAndClarifier()
+        self.calendar_importer = CalendarScreenshotImporter(
+            default_timezone=settings.default_timezone,
+            lead_minutes=settings.calendar_import_lead_minutes,
+            fallback_to_today=settings.calendar_import_fallback_to_today,
+        )
 
     def _looks_like_new_request(self, message_text: str) -> bool:
         lowered = (message_text or '').strip().lower()
@@ -956,6 +962,32 @@ class InterpretationService:
                 [InlineKeyboardButton("✏️ Edit", callback_data="confirm:edit"), InlineKeyboardButton("❌ Cancel", callback_data="confirm:cancel")],
             ]
         )
+
+
+
+    def handle_calendar_screenshot_import(self, session, *, chat_id: int, telegram_user_id: int, image_path: str, caption_text: str | None) -> BotResponsePlan:
+        if not self.settings.calendar_import_enabled:
+            return BotResponsePlan(text="Calendar screenshot import is disabled for this bot.")
+        try:
+            proposal = self.calendar_importer.import_from_image(image_path, caption_text=caption_text)
+        except CalendarImportError as exc:
+            self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=caption_text or '[calendar screenshot]', phase='calendar_import', outcome='failed')
+            return BotResponsePlan(text=str(exc))
+
+        items = [
+            MultiPlanItem(task=f"Meeting: {meeting.title}", time_phrase=meeting.reminder_time_phrase, requires_ack=False)
+            for meeting in proposal.meetings
+        ]
+        state = MultiPlanConfirmationState(
+            source_message_text=caption_text or 'calendar screenshot import',
+            items=items,
+            confidence=0.9,
+            shared_context=proposal.day_hint,
+        )
+        self._save_multi_plan_state(session, chat_id=chat_id, telegram_user_id=telegram_user_id, state=state)
+        self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=caption_text or '[calendar screenshot]', phase='calendar_import', outcome='proposal_ready')
+        self.reference_memory.remember(session, chat_id=chat_id, telegram_user_id=telegram_user_id, task=items[0].task if items else None, time_phrase=items[0].time_phrase if items else None)
+        return BotResponsePlan(text=proposal.confirmation_text())
 
     def _get_pending_state(self, session, *, chat_id: int) -> PendingConversationState | None:
         stmt = select(ConversationState).where(ConversationState.chat_id == chat_id)

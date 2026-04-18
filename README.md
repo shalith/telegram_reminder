@@ -315,3 +315,17 @@ This package adds memory-based interpretation:
 - suggests likely follow-up times for known tasks
 - boosts confidence for familiar task + time-of-day combinations
 - stores task memory in `task_memory_profiles`
+
+
+## Phase 10.1 — Calendar Screenshot Import
+
+You can now send a Teams calendar screenshot as a Telegram photo or image document.
+The bot will try to:
+- read visible meeting titles and start times
+- propose reminders 10 minutes before each meeting
+- ask you to confirm before creating them
+
+Notes:
+- Best results come from a clear day-view screenshot with meeting titles and times visible.
+- Add a caption like `tomorrow` or `18 Apr` if the date is not obvious in the screenshot.
+- OCR support requires the Tesseract OCR engine. The provided Dockerfile installs it automatically.
