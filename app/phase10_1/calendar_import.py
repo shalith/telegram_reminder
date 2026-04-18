@@ -327,6 +327,16 @@ class CalendarScreenshotImporter:
             return None
         return dt.replace(second=0, microsecond=0)
 
+    def _is_cancelled_title(self, title: str) -> bool:
+        normalized = re.sub(r'\s+', ' ', (title or '')).strip().lower()
+        if not normalized:
+            return False
+        cancelled_terms = [
+            'canceled', 'cancelled', 'cancelled:', 'canceled:',
+            'annule', 'annulé', 'annule:', 'annulé:',
+        ]
+        return any(term in normalized for term in cancelled_terms)
+
     def _sanitize_meeting_title(self, title: str) -> str:
         title = re.sub(r'\s+', ' ', title).strip(' -–—:')
         title = title.replace('Microsoft Teams Microsoft Teams', 'Microsoft Teams')
