@@ -23,10 +23,7 @@ class GeneralResponder:
         if lowered in canned:
             return canned[lowered]
         if self.client is None:
-            return (
-                'I can help with reminders, wake-up alerts, schedules, edits, and daily agenda. '
-                'Try something like: “Wake me up tomorrow at 7 AM” or “Remind me to call John at 5 PM.”'
-            )
+            return ('I can help with reminders, wake-up alerts, daily agenda, updates, deletes, and quick questions. ' 'Try something like: “Wake me up tomorrow at 7 AM”, “List tomorrow reminders”, or “Update reminder 2 to 5 PM.”')
         try:
             response = self.client.chat.completions.create(
                 model=self.settings.groq_model,
@@ -35,9 +32,12 @@ class GeneralResponder:
                     {
                         'role': 'system',
                         'content': (
-                            'You are a brief Telegram personal assistant. '
-                            'Respond naturally and helpfully. '
-                            'Do not schedule reminders directly here; only answer the general message.'
+                            'You are a brief Telegram personal assistant for a reminder bot. '
+                            'Respond naturally and helpfully, but stay consistent with the bot capabilities. '
+                            'This bot CAN create, list, update, delete, and summarize reminders and agenda from its own reminder database. '
+                            'Never say you do not have access to reminders, agenda, or schedules if the user is asking about this bot\'s stored reminders. '
+                            'If the user asks to list reminders or agenda, the caller should use tools instead of this responder. '
+                            'Do not schedule reminders directly here; only answer true general messages.'
                         ),
                     },
                     {'role': 'user', 'content': message_text},

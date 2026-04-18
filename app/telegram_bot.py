@@ -12,6 +12,7 @@ from app.db import get_session
 from app.models import ReminderStatus
 from app.recurrence import format_dt_for_user
 from app.runtime import RuntimeState
+from app.phase9_4 import ExecutionGuard
 from app.scheduler import ReminderScheduler
 from app.service import ReminderService, reminder_summary_line
 from app.services.interpretation_service import InterpretationService
@@ -42,6 +43,7 @@ class TelegramReminderBot:
         self.service = ReminderService()
         self.runtime_state = runtime_state
         self.interpretation_service = InterpretationService(settings, reminder_scheduler, runtime_state)
+        self.execution_guard = ExecutionGuard()
 
     def build(self) -> Application:
         application = ApplicationBuilder().token(self.settings.telegram_bot_token).post_init(self._post_init).build()
@@ -120,6 +122,13 @@ class TelegramReminderBot:
             return
         incoming_text = update.message.text or ""
         self.runtime_state.record_inbound_message()
+        lowered = " ".join(incoming_text.strip().lower().split())
+        should_guard = lowered.startswith((
+            "remind me", "wake me up", "wake up me", "wake up", "list", "show", "what", "update", "delete", "cancel", "remove",
+        )) or "tomorrow" in lowered or "today" in lowered
+        if should_guard and self.execution_guard.should_skip_repeated_message(chat_id=update.effective_chat.id, message_text=incoming_text):
+            await self._reply_text(update, "I already received that same request just now. If you meant something different, please rephrase it a little.")
+            return
         try:
             with get_session() as session:
                 plan = self.interpretation_service.handle_user_message(
@@ -129,9 +138,10 @@ class TelegramReminderBot:
                     message_text=incoming_text,
                 )
             await self._reply_text(update, plan.text, reply_markup=plan.reply_markup)
-        except Exception:
+        except Exception as exc:
+            self.runtime_state.record_error(str(exc))
             logger.exception('Text message handling failed', extra={'event': 'text_message_failed'})
-            await self._reply_text(update, 'Sorry — that request failed unexpectedly. Please try again with a fresh message.')
+            await self._reply_text(update, 'Sorry — that request failed unexpectedly. Nothing new was scheduled. Please try again with a fresh message.')
 
 
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -140,8 +150,21 @@ class TelegramReminderBot:
             return
 
         self.runtime_state.record_callback()
-        await query.answer()
         callback_data = query.data or ""
+        if not self.execution_guard.mark_callback_started(
+            callback_query_id=query.id,
+            callback_data=callback_data,
+            chat_id=update.effective_chat.id,
+        ):
+            cached = self.execution_guard.get_callback_result(
+                callback_query_id=query.id,
+                callback_data=callback_data,
+                chat_id=update.effective_chat.id,
+            )
+            await query.answer(cached or 'Already handled.', show_alert=False)
+            return
+
+        await query.answer()
         parts = callback_data.split(":")
         action = parts[0]
 
@@ -151,6 +174,7 @@ class TelegramReminderBot:
                     if query.message is not None:
                         await query.message.reply_text("That selection payload is invalid.")
                         self.runtime_state.record_outbound_message()
+                    self.execution_guard.remember_callback_result(callback_query_id=query.id, callback_data=callback_data, chat_id=update.effective_chat.id, response_text="That selection payload is invalid.")
                     return
                 ai_run_id = int(parts[1])
                 reminder_id = int(parts[2])
@@ -166,6 +190,7 @@ class TelegramReminderBot:
                     await self._safe_clear_callback_markup(query)
                     await query.message.reply_text(text)
                     self.runtime_state.record_outbound_message()
+                self.execution_guard.remember_callback_result(callback_query_id=query.id, callback_data=callback_data, chat_id=update.effective_chat.id, response_text=text)
                 return
 
             if action == "confirm":
@@ -181,6 +206,7 @@ class TelegramReminderBot:
                     await self._safe_clear_callback_markup(query)
                     await query.message.reply_text(text)
                     self.runtime_state.record_outbound_message()
+                self.execution_guard.remember_callback_result(callback_query_id=query.id, callback_data=callback_data, chat_id=update.effective_chat.id, response_text=text)
                 return
 
             if len(parts) < 2 or not parts[1].isdigit():
@@ -223,6 +249,7 @@ class TelegramReminderBot:
                         else:
                             await query.message.reply_text(f"Got it — reminder #{updated.id} acknowledged.")
                         self.runtime_state.record_outbound_message()
+                    self.execution_guard.remember_callback_result(callback_query_id=query.id, callback_data=callback_data, chat_id=update.effective_chat.id, response_text=f"Got it — reminder #{updated.id} acknowledged.")
                     return
 
                 if action == "snooze":
@@ -230,27 +257,31 @@ class TelegramReminderBot:
                     snooze_until = datetime.now(UTC) + timedelta(minutes=preference.default_snooze_minutes)
                     updated = self.service.snooze_reminder(session, reminder=reminder, snooze_until_utc=snooze_until)
                     self.scheduler.schedule_reminder(updated.id, updated.next_run_at_utc, updated.job_id)
+                    next_run = (
+                        format_dt_for_user(updated.next_run_at_utc, updated.timezone)
+                        if updated.next_run_at_utc
+                        else "later"
+                    )
+                    result_text = f"Snoozed reminder #{updated.id} for {preference.default_snooze_minutes} minutes. Next alert: {next_run}."
                     if query.message is not None:
                         await self._safe_clear_callback_markup(query)
-                        next_run = (
-                            format_dt_for_user(updated.next_run_at_utc, updated.timezone)
-                            if updated.next_run_at_utc
-                            else "later"
-                        )
-                        await query.message.reply_text(
-                            f"Snoozed reminder #{updated.id} for {preference.default_snooze_minutes} minutes. Next alert: {next_run}."
-                        )
+                        await query.message.reply_text(result_text)
                         self.runtime_state.record_outbound_message()
+                    self.execution_guard.remember_callback_result(callback_query_id=query.id, callback_data=callback_data, chat_id=update.effective_chat.id, response_text=result_text)
                     return
 
             if query.message is not None:
                 await query.message.reply_text("That action is not supported.")
                 self.runtime_state.record_outbound_message()
+                self.execution_guard.remember_callback_result(callback_query_id=query.id, callback_data=callback_data, chat_id=update.effective_chat.id, response_text="That action is not supported.")
         except Exception:
+            self.runtime_state.record_error(f'callback_failed:{callback_data}')
             logger.exception("Callback query handling failed", extra={"event": "callback_query_failed", "callback_data": callback_data})
             if query.message is not None:
-                await query.message.reply_text("Sorry — that button action failed. Please try the request again.")
+                error_text = "Sorry — that button action failed safely, and no duplicate action was taken. Please try the request again."
+                await query.message.reply_text(error_text)
                 self.runtime_state.record_outbound_message()
+                self.execution_guard.remember_callback_result(callback_query_id=query.id, callback_data=callback_data, chat_id=update.effective_chat.id, response_text=error_text)
 
     async def _safe_clear_callback_markup(self, query) -> None:
         try:

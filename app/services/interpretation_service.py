@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -15,7 +16,8 @@ from app.learning import EvalBuilder, ExampleMemoryStore, FeedbackStore, RuleSug
 from app.models import ConversationState
 from app.parser import split_task_and_time_phrase
 from app.repositories.ai_run_repo import AiRunRepository
-from app.service import ReminderService
+from app.assistant_features import local_day_bounds_utc
+from app.service import ReminderService, reminder_summary_line
 from app.services.audit_service import AuditService
 from app.services.duplicate_detection_service import DuplicateDetectionService
 from app.services.target_resolution_service import TargetResolutionService
@@ -23,6 +25,8 @@ from app.phase7 import EvaluatorAgent, SemanticConflictDetector
 from app.phase8 import MemoryProfileStore, MemoryReasoner
 from app.phase9 import MultiPlanConfirmationState, MultiReminderPlanner, ProactiveSuggester
 from app.phase9_1 import GeneralResponder, LLMConversationRouter, ThreadConversationState, ThreadMemoryStore
+from app.phase9_2 import ToolFirstRouter, ReferenceResolver, ReferenceContext, ReferenceMemoryStore, ChatReferenceState
+from app.phase9_3 import ConversationRepairAndClarifier
 from app.tools.create_reminder import CreateReminderTool
 from app.tools.deadline_chain import DeadlineChainTool
 from app.tools.delete_reminder import DeleteReminderTool
@@ -32,6 +36,7 @@ from app.tools.set_preferences import SetPreferencesTool
 from app.tools.today_agenda import TodayAgendaTool
 from app.tools.update_reminder import UpdateReminderTool
 from app.ai.time_normalizer import looks_like_time_phrase, normalize_time_phrase
+from app.recurrence import format_dt_for_user
 from app.semantic_judgment import (
     apply_semantic_judgment,
     build_semantic_confirmation_text,
@@ -101,6 +106,10 @@ class InterpretationService:
         self.thread_memory = ThreadMemoryStore()
         self.conversation_router = LLMConversationRouter(settings)
         self.general_responder = GeneralResponder(settings)
+        self.tool_router = ToolFirstRouter()
+        self.reference_resolver = ReferenceResolver()
+        self.reference_memory = ReferenceMemoryStore()
+        self.repair_clarifier = ConversationRepairAndClarifier()
 
     def _looks_like_new_request(self, message_text: str) -> bool:
         lowered = (message_text or '').strip().lower()
@@ -176,9 +185,10 @@ class InterpretationService:
         confirmation_state = self._get_confirmation_state(session, chat_id=chat_id)
         thread_state = self._get_thread_state(session, chat_id=chat_id)
 
+        active_thread = thread_state is not None and thread_state.status != 'idle'
         route = self.conversation_router.route(
             message_text=cleaned,
-            has_active_thread=any([plan_state is not None, pending_state is not None, confirmation_state is not None, thread_state is not None]),
+            has_active_thread=any([plan_state is not None, pending_state is not None, confirmation_state is not None, active_thread]),
             has_pending_confirmation=plan_state is not None or confirmation_state is not None,
             has_pending_follow_up=pending_state is not None,
         )
@@ -207,10 +217,89 @@ class InterpretationService:
             timezone_name=self.settings.default_timezone,
         )
         open_reminders = self.reminder_service.list_open_reminders(session, chat_id=chat_id)
+        reference_state = self.reference_memory.get(session, chat_id=chat_id)
+        ref_ctx = ReferenceContext(
+            last_discussed_task=reference_state.last_discussed_task,
+            last_discussed_time_phrase=reference_state.last_discussed_time_phrase,
+            last_created_reminder_id=reference_state.last_created_reminder_id,
+            last_listed_reminder_ids=reference_state.last_listed_reminder_ids,
+            last_referenced_reminder_id=reference_state.last_referenced_reminder_id,
+        )
 
-        if route.route == 'general_chat' and plan_state is None and pending_state is None and confirmation_state is None and not self._looks_like_new_request(cleaned):
+        current_task, current_time_phrase = self._conversation_task_time(
+            pending_state=pending_state,
+            confirmation_state=confirmation_state,
+            reference_state=reference_state,
+            open_reminders=open_reminders,
+        )
+        repair_rewrite = self.repair_clarifier.maybe_rewrite(
+            cleaned,
+            current_task=current_task,
+            current_time_phrase=current_time_phrase,
+        )
+        if repair_rewrite is not None:
+            if repair_rewrite.message_text == '__CHANGE_TIME_ONLY__':
+                if current_task:
+                    pending = PendingConversationState(
+                        action='create_reminder' if confirmation_state is None else confirmation_state.action,
+                        reminder=(confirmation_state.envelope.reminder.model_copy(deep=True) if confirmation_state is not None else (pending_state.reminder.model_copy(deep=True) if pending_state is not None else ReminderDraft(task=current_task))),
+                        target=(confirmation_state.envelope.target.model_copy(deep=True) if confirmation_state is not None else (pending_state.target.model_copy(deep=True) if pending_state is not None else TargetSelector())),
+                        preferences=PreferencePatch(),
+                        follow_up=FollowUp(needed=True, question=f"What time should I use? I'll keep the task as \"{current_task}\".", missing_fields=['time_phrase']),
+                        user_message_summary='phase9_3_change_time_only',
+                        source_message_text=confirmation_state.source_message_text if confirmation_state is not None else message_text,
+                        follow_up_turns=(pending_state.follow_up_turns + 1) if pending_state is not None else 1,
+                    )
+                    self._save_pending_state(session, chat_id=chat_id, telegram_user_id=telegram_user_id, state=pending)
+                    self._clear_confirmation_state(session, chat_id=chat_id)
+                    return BotResponsePlan(text=pending.follow_up.question or 'What time should I use?')
+            elif repair_rewrite.message_text == '__CHANGE_DATE_ONLY__':
+                if current_task:
+                    pending = PendingConversationState(
+                        action='create_reminder' if confirmation_state is None else confirmation_state.action,
+                        reminder=(confirmation_state.envelope.reminder.model_copy(deep=True) if confirmation_state is not None else (pending_state.reminder.model_copy(deep=True) if pending_state is not None else ReminderDraft(task=current_task))),
+                        target=(confirmation_state.envelope.target.model_copy(deep=True) if confirmation_state is not None else (pending_state.target.model_copy(deep=True) if pending_state is not None else TargetSelector())),
+                        preferences=PreferencePatch(),
+                        follow_up=FollowUp(needed=True, question=f"What new date should I use? I'll keep the task as \"{current_task}\".", missing_fields=['time_phrase']),
+                        user_message_summary='phase9_3_change_date_only',
+                        source_message_text=confirmation_state.source_message_text if confirmation_state is not None else message_text,
+                        follow_up_turns=(pending_state.follow_up_turns + 1) if pending_state is not None else 1,
+                    )
+                    self._save_pending_state(session, chat_id=chat_id, telegram_user_id=telegram_user_id, state=pending)
+                    self._clear_confirmation_state(session, chat_id=chat_id)
+                    return BotResponsePlan(text=pending.follow_up.question or 'What new date should I use?')
+            else:
+                cleaned = repair_rewrite.message_text
+                lowered = cleaned.lower()
+
+        tool_plan, cleaned = self._handle_tool_first_route(
+            session,
+            chat_id=chat_id,
+            telegram_user_id=telegram_user_id,
+            message_text=cleaned,
+            lowered=lowered,
+            pref=pref,
+            open_reminders=open_reminders,
+            reference_state=reference_state,
+        )
+        if tool_plan is not None:
+            return tool_plan
+        lowered = cleaned.lower()
+        cleaned = self.reference_resolver.substitute_pronoun_create(cleaned, ref_ctx)
+        lowered = cleaned.lower()
+        pre_general_indirect = infer_indirect_reminder(cleaned)
+        if pre_general_indirect is not None and pre_general_indirect.reminder.task:
+            self.reference_memory.remember(
+                session,
+                chat_id=chat_id,
+                telegram_user_id=telegram_user_id,
+                task=pre_general_indirect.reminder.task,
+                time_phrase=pre_general_indirect.reminder.datetime_text,
+            )
+
+        if route.route == 'general_chat' and plan_state is None and pending_state is None and confirmation_state is None and not self._looks_like_new_request(cleaned) and pre_general_indirect is None:
             self._clear_thread_state(session, chat_id=chat_id)
-            return BotResponsePlan(text=self.general_responder.respond(message_text=message_text))
+            return BotResponsePlan(text=self.general_responder.respond(message_text=cleaned))
 
         if pending_state is not None and self._looks_like_new_request(cleaned):
             self._clear_pending_state(session, chat_id=chat_id)
@@ -276,6 +365,25 @@ class InterpretationService:
                 self._clear_confirmation_state(session, chat_id=chat_id)
                 self._clear_thread_state(session, chat_id=chat_id)
                 return BotResponsePlan(text="Okay — I cancelled that pending action.")
+            if route.route == 'repair_conversation' or detect_repair_signal(prepared_message_text) is not None or repair_rewrite is not None:
+                pending = PendingConversationState(
+                    action=confirmation_state.action,
+                    reminder=confirmation_state.envelope.reminder.model_copy(deep=True),
+                    target=confirmation_state.envelope.target.model_copy(deep=True),
+                    preferences=confirmation_state.envelope.preferences.model_copy(deep=True),
+                    follow_up=FollowUp(needed=True, question='Understood — what should I change? You can reply with a new time like "2 PM" or a correction like "use tomorrow instead".', missing_fields=['time_phrase']),
+                    user_message_summary='phase9_3_confirmation_repair',
+                    source_message_text=confirmation_state.source_message_text or message_text,
+                    follow_up_turns=1,
+                )
+                self._save_pending_state(session, chat_id=chat_id, telegram_user_id=telegram_user_id, state=pending)
+                self._clear_confirmation_state(session, chat_id=chat_id)
+                if repair_rewrite is not None and repair_rewrite.handled_as_follow_up and repair_rewrite.message_text not in {'__CHANGE_TIME_ONLY__', '__CHANGE_DATE_ONLY__'}:
+                    prepared_message_text = repair_rewrite.message_text
+                    cleaned = prepared_message_text
+                    lowered = cleaned.lower()
+                else:
+                    return BotResponsePlan(text=pending.follow_up.question or 'What should I change?')
 
         repair_plan = self._try_repair_conversation(
             session,
@@ -319,7 +427,7 @@ class InterpretationService:
         envelope = interpreter_result.envelope
         if pending_state is not None and envelope.action == "clarify":
             envelope = self._merge_pending_state(pending_state, prepared_message_text)
-        if envelope.action == "clarify":
+        if envelope.action in {"clarify", "help"}:
             inferred = infer_indirect_reminder(prepared_message_text)
             if inferred is not None:
                 envelope = inferred
@@ -528,7 +636,7 @@ class InterpretationService:
 
         confirmation_state = self._get_confirmation_state(session, chat_id=chat_id)
         if confirmation_state is None:
-            return "That confirmation has expired. Please send the request again."
+            return "That confirmation was already used or has expired. Please send the request again if you still want to do it."
         if choice == "cancel":
             self.self_learning.record_correction(
                 session,
@@ -690,10 +798,13 @@ class InterpretationService:
                 recurrence=envelope.reminder.recurrence_text,
                 timezone_name=pref.timezone,
             )
-            if duplicates and not was_confirmed:
-                self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=original_message_text, phase="create", outcome="duplicate_block")
+            if duplicates:
                 dup = duplicates[0]
-                return BotResponsePlan(text=f"This looks very similar to reminder #{dup.id}: {dup.task}. Confirm first, or use /list to review your reminders.")
+                if not was_confirmed:
+                    self.feedback.record(session, chat_id=chat_id, telegram_user_id=telegram_user_id, message_text=original_message_text, phase="create", outcome="duplicate_block")
+                    return BotResponsePlan(text=f"This looks very similar to reminder #{dup.id}: {dup.task}. Confirm first, or use /list to review your reminders.")
+                self.audit.record_action(session, user_id=telegram_user_id, reminder_id=dup.id, action_name="create_reminder_idempotent", action_args_json=envelope.model_dump_json(), executor_result_json=json.dumps({"text": f"Reminder #{dup.id} already exists"}), status="success")
+                return BotResponsePlan(text=f"I already have reminder #{dup.id} for that: {dup.task}. I did not create a duplicate.")
             reminder, status = self.create_tool.execute(
                 session,
                 scheduler=self.scheduler,
@@ -723,6 +834,7 @@ class InterpretationService:
             self.audit.record_action(session, user_id=telegram_user_id, reminder_id=reminder.id, action_name=envelope.action, action_args_json=envelope.model_dump_json(), executor_result_json=json.dumps({"text": text}), status="success")
             self._record_success_learning(session, chat_id=chat_id, telegram_user_id=telegram_user_id, source_text=source_text or original_message_text, action_name=envelope.action, task=reminder.task, time_phrase=envelope.reminder.datetime_text, learned_from_follow_up=False, notes=("confirmed" if was_confirmed else "success"))
             self.memory_profiles.remember_from_values(session, telegram_user_id=telegram_user_id, task=reminder.task, hour_local=reminder.hour_local, minute_local=reminder.minute_local, recurrence_type=reminder.recurrence_type, confirmed=was_confirmed)
+            self.reference_memory.remember(session, chat_id=chat_id, telegram_user_id=telegram_user_id, task=reminder.task, time_phrase=envelope.reminder.datetime_text, created_reminder_id=reminder.id)
             return BotResponsePlan(text=text)
 
         if envelope.action in {"update_reminder", "delete_reminder"}:
@@ -752,6 +864,7 @@ class InterpretationService:
                 text = f"Cancelled reminder #{deleted.id}: {deleted.task}"
                 self.audit.record_action(session, user_id=telegram_user_id, reminder_id=deleted.id, action_name=envelope.action, action_args_json=envelope.model_dump_json(), executor_result_json=json.dumps({"text": text}), status="success")
                 self._record_success_learning(session, chat_id=chat_id, telegram_user_id=telegram_user_id, source_text=original_message_text, action_name=envelope.action, task=deleted.task, time_phrase=None, learned_from_follow_up=False, notes=("confirmed" if was_confirmed else "success"))
+                self.reference_memory.remember(session, chat_id=chat_id, telegram_user_id=telegram_user_id, referenced_reminder_id=deleted.id, task=deleted.task)
                 return BotResponsePlan(text=text)
             updated, status = self.update_tool.execute(
                 session,
@@ -942,6 +1055,18 @@ class InterpretationService:
     def _clear_thread_state(self, session, *, chat_id: int) -> None:
         self.thread_memory.clear(session, chat_id=chat_id)
 
+    def _conversation_task_time(self, *, pending_state, confirmation_state, reference_state, open_reminders: list) -> tuple[str | None, str | None]:
+        if pending_state is not None:
+            return pending_state.reminder.task, pending_state.reminder.datetime_text
+        if confirmation_state is not None:
+            return confirmation_state.envelope.reminder.task, confirmation_state.envelope.reminder.datetime_text
+        if reference_state.last_discussed_task or reference_state.last_discussed_time_phrase:
+            return reference_state.last_discussed_task, reference_state.last_discussed_time_phrase
+        if open_reminders:
+            latest = max(open_reminders, key=lambda reminder: reminder.id)
+            return latest.task, None
+        return None, None
+
     def _save_pending_state(self, session, *, chat_id: int, telegram_user_id: int, state: PendingConversationState) -> None:
         stmt = select(ConversationState).where(ConversationState.chat_id == chat_id)
         row = session.scalar(stmt)
@@ -1090,6 +1215,79 @@ class InterpretationService:
             )
 
         return None
+
+
+    def _handle_tool_first_route(self, session, *, chat_id: int, telegram_user_id: int, message_text: str, lowered: str, pref, open_reminders: list, reference_state: ChatReferenceState) -> tuple[BotResponsePlan | None, str]:
+        route = self.tool_router.detect(message_text)
+        cleaned = message_text
+        if route.kind == "list_all":
+            text = self.list_tool.execute(session, chat_id=chat_id)
+            self.reference_memory.remember(session, chat_id=chat_id, telegram_user_id=telegram_user_id, listed_reminder_ids=[r.id for r in open_reminders])
+            return BotResponsePlan(text=text), cleaned
+        if route.kind == "list_today":
+            reminders = self.reminder_service.list_today_reminders(session, chat_id=chat_id, timezone_name=pref.timezone)
+            self.reference_memory.remember(session, chat_id=chat_id, telegram_user_id=telegram_user_id, listed_reminder_ids=[r.id for r in reminders])
+            return BotResponsePlan(text=self.today_tool.execute(session, chat_id=chat_id, timezone_name=pref.timezone)), cleaned
+        if route.kind == "list_tomorrow":
+            return BotResponsePlan(text=self._render_tomorrow(session, chat_id=chat_id, timezone_name=pref.timezone, telegram_user_id=telegram_user_id)), cleaned
+        if route.kind == "prefs":
+            return BotResponsePlan(text=self.reminder_service.format_preferences_summary(pref)), cleaned
+        if route.kind == "missed":
+            return BotResponsePlan(text=self.missed_tool.execute(session, chat_id=chat_id)), cleaned
+
+        available_sorted_ids = [r.id for r in open_reminders]
+        target_id = self.reference_resolver.extract_target_id(message_text, available_sorted_ids)
+        if target_id is None:
+            target_id = self.reference_resolver.extract_task_reference(message_text, open_reminders)
+
+        if route.kind in {"delete_like", "update_like"} and target_id is None and open_reminders:
+            ambiguous = self.repair_clarifier.build_reference_clarification(text=message_text, candidate_reminders=open_reminders)
+            if ambiguous is not None:
+                pending = PendingConversationState(
+                    action='delete_reminder' if route.kind == 'delete_like' else 'update_reminder',
+                    reminder=ReminderDraft(),
+                    target=TargetSelector(),
+                    preferences=PreferencePatch(),
+                    follow_up=FollowUp(needed=True, question=ambiguous.text, missing_fields=['target']),
+                    user_message_summary='phase9_3_reference_clarification',
+                    source_message_text=message_text,
+                    follow_up_turns=1,
+                )
+                self._save_pending_state(session, chat_id=chat_id, telegram_user_id=telegram_user_id, state=pending)
+                return BotResponsePlan(text=ambiguous.text), cleaned
+
+        if route.kind == "delete_like" and target_id is not None:
+            cleaned = self.reference_resolver.build_delete_rewrite(message_text, target_id)
+            self.reference_memory.remember(session, chat_id=chat_id, telegram_user_id=telegram_user_id, referenced_reminder_id=target_id)
+        elif route.kind == "update_like" and target_id is not None:
+            cleaned = self.reference_resolver.build_update_rewrite(message_text, target_id)
+            self.reference_memory.remember(session, chat_id=chat_id, telegram_user_id=telegram_user_id, referenced_reminder_id=target_id)
+        elif route.kind == "create_like":
+            cleaned = self.reference_resolver.substitute_pronoun_create(message_text, ReferenceContext(
+                last_discussed_task=reference_state.last_discussed_task,
+                last_discussed_time_phrase=reference_state.last_discussed_time_phrase,
+                last_created_reminder_id=reference_state.last_created_reminder_id,
+                last_listed_reminder_ids=reference_state.last_listed_reminder_ids,
+                last_referenced_reminder_id=reference_state.last_referenced_reminder_id,
+            ))
+        return None, cleaned
+
+    def _render_tomorrow(self, session, *, chat_id: int, timezone_name: str, telegram_user_id: int) -> str:
+        start_utc, _ = local_day_bounds_utc(timezone_name=timezone_name)
+        tomorrow_start = start_utc + timedelta(days=1)
+        tomorrow_end = tomorrow_start + timedelta(days=1)
+        reminders = [
+            r for r in self.reminder_service.list_open_reminders(session, chat_id=chat_id)
+            if r.next_run_at_utc is not None and tomorrow_start.replace(tzinfo=None) <= r.next_run_at_utc < tomorrow_end.replace(tzinfo=None)
+        ]
+        self.reference_memory.remember(session, chat_id=chat_id, telegram_user_id=telegram_user_id, listed_reminder_ids=[r.id for r in reminders])
+        if not reminders:
+            return "You have no upcoming reminders for tomorrow."
+        lines = ["Tomorrow's reminders:"]
+        for reminder in reminders:
+            when_label = format_dt_for_user(reminder.next_run_at_utc, reminder.timezone) if reminder.next_run_at_utc else "not scheduled"
+            lines.append(f"• {reminder_summary_line(reminder, when_label)}")
+        return "\n".join(lines)
 
     def _apply_preference_value(self, prefs, text: str) -> None:
         lowered = text.lower().strip()

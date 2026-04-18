@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 
-from telegram.error import Conflict
+from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
 
 from telegram import Update
 
@@ -45,6 +45,7 @@ def main() -> None:
 
     try:
         conflict_attempt = 0
+        recoverable_attempt = 0
         while True:
             try:
                 application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
@@ -56,6 +57,16 @@ def main() -> None:
                 logger.warning(
                     "Polling conflict detected; another bot instance may still be running. Retrying.",
                     extra={"event": "polling_conflict", "attempt": conflict_attempt, "wait_seconds": wait_seconds},
+                )
+                time.sleep(wait_seconds)
+                continue
+            except (NetworkError, TimedOut, RetryAfter) as exc:  # pragma: no cover
+                recoverable_attempt += 1
+                runtime_state.record_error(str(exc))
+                wait_seconds = min(60, max(5, 4 * recoverable_attempt))
+                logger.warning(
+                    "Recoverable Telegram polling error detected; restarting polling loop.",
+                    extra={"event": "polling_recoverable_error", "attempt": recoverable_attempt, "wait_seconds": wait_seconds},
                 )
                 time.sleep(wait_seconds)
                 continue

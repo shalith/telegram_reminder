@@ -230,3 +230,17 @@ class LearnedTimePattern(Base):
     success_count: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now(), onupdate=func.now())
+
+
+class ChatReferenceMemory(Base):
+    __tablename__ = "chat_reference_memory"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    last_discussed_task: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    last_discussed_time_phrase: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_created_reminder_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_listed_reminder_ids_json: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    last_referenced_reminder_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(), server_default=func.now(), onupdate=func.now())
