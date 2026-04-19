@@ -390,20 +390,37 @@ class CalendarScreenshotImporter:
                     candidate_boxes.append((box, title, quality))
             candidate_boxes.sort(key=lambda item: item[0].top)
             used: set[int] = set()
-            for meeting in group:
+            ordered_mode = len(group) <= 4 and len(candidate_boxes) >= len(group) and len(candidate_boxes) <= len(group) + 1
+            for meeting_idx, meeting in enumerate(group):
                 best_idx = None
                 best_score = -1.0
                 mtokens = set(re.findall(r'[a-z0-9]+', meeting.title.lower()))
-                for idx, (box, title, quality) in enumerate(candidate_boxes):
-                    if idx in used:
-                        continue
-                    btokens = set(re.findall(r'[a-z0-9]+', title.lower()))
-                    overlap = len(mtokens & btokens)
-                    order_bias = max(0.0, 1.0 - abs(idx - len(used)) * 0.15)
-                    score = overlap * 2.0 + quality + order_bias
-                    if score > best_score:
-                        best_score = score
-                        best_idx = idx
+                if ordered_mode:
+                    # When meetings in a day column appear in the same top-to-bottom order as the visual blocks,
+                    # prefer order-based alignment. This stabilizes LLM-extracted meetings whose titles are good
+                    # but whose initial start times still snap to full hours.
+                    for idx, (box, title, quality) in enumerate(candidate_boxes):
+                        if idx in used:
+                            continue
+                        btokens = set(re.findall(r'[a-z0-9]+', title.lower()))
+                        overlap = len(mtokens & btokens)
+                        order_distance = abs(idx - meeting_idx)
+                        order_bias = max(0.0, 1.35 - order_distance * 0.55)
+                        score = overlap * 1.5 + quality * 0.6 + order_bias
+                        if score > best_score:
+                            best_score = score
+                            best_idx = idx
+                else:
+                    for idx, (box, title, quality) in enumerate(candidate_boxes):
+                        if idx in used:
+                            continue
+                        btokens = set(re.findall(r'[a-z0-9]+', title.lower()))
+                        overlap = len(mtokens & btokens)
+                        order_bias = max(0.0, 1.0 - abs(idx - len(used)) * 0.15)
+                        score = overlap * 2.0 + quality + order_bias
+                        if score > best_score:
+                            best_score = score
+                            best_idx = idx
                 if best_idx is None:
                     calibrated.append(meeting)
                     continue
