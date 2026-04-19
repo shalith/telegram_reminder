@@ -455,13 +455,16 @@ class CalendarScreenshotImporter:
                 current.append(box)
             else:
                 groups.append([box])
-        clusters = []
-        for group in groups:
-            left = min(b.left for b in group) - 20
-            right = max(b.right for b in group) + 20
-            center = sum(b.cx for b in group) / len(group)
+
+        # Use non-overlapping column bands derived from group centres. This is more stable than
+        # padding each group's raw box extents, which can create overlapping columns and cause lower
+        # meeting rows in the second day column to inherit the first day's time calibration.
+        centers = [sum(b.cx for b in group) / len(group) for group in groups]
+        clusters: list[tuple[float, float, float]] = []
+        for idx, center in enumerate(centers):
+            left = 0.0 if idx == 0 else (centers[idx - 1] + center) / 2
+            right = float(image_width) if idx == len(centers) - 1 else (center + centers[idx + 1]) / 2
             clusters.append((left, right, center))
-        clusters.sort(key=lambda item: item[2])
         return clusters
 
     def _load_image(self, image_path: str | Path) -> Image.Image:
