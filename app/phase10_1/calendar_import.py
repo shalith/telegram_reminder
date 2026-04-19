@@ -163,8 +163,10 @@ class CalendarScreenshotImporter:
 
     def import_from_image(self, image_path: str | Path, *, caption_text: str | None = None) -> CalendarImportProposal:
         base_image = self._load_image(image_path)
+        processed = self._prepare_for_ocr(base_image)
         llm_meetings = self._extract_meetings_vision_llm(base_image=base_image, caption_text=caption_text)
         if llm_meetings:
+            llm_meetings = self._calibrate_llm_meetings_with_grid(base_image=base_image, processed=processed, meetings=llm_meetings)
             meetings = self._dedupe_meetings(llm_meetings, limit=8)
             meetings = self._keep_best_per_slot(meetings)
             if meetings:
@@ -175,7 +177,6 @@ class CalendarScreenshotImporter:
                     raw_text='vision_llm',
                 )
 
-        processed = self._prepare_for_ocr(base_image)
         raw_text = self._ocr_text(processed)
 
         # OCR text parsing is allowed only when the extracted text itself looks coherent.
@@ -345,6 +346,107 @@ class CalendarScreenshotImporter:
             return 'Meeting'
         return title
 
+    def _calibrate_llm_meetings_with_grid(self, *, base_image: Image.Image, processed: Image.Image, meetings: list[ImportedMeeting]) -> list[ImportedMeeting]:
+        try:
+            words = self._ocr_words(processed)
+        except Exception:
+            return meetings
+        time_rows = self._extract_time_rows(words, image_width=processed.size[0], image_height=processed.size[1])
+        if not time_rows:
+            return meetings
+        time_rows = self._scale_time_rows(time_rows, from_height=processed.size[1], to_height=base_image.size[1])
+        # If OCR only yields one row, synthesize the next row using the average grid spacing.
+        if len(time_rows) == 1:
+            only = time_rows[0]
+            time_rows.append(TimeRow(phrase=f"{only.hour_24 + 1}:00", hour_24=min(23, only.hour_24 + 1), y=only.y + 60))
+        grid_left = 0
+        grid_right = base_image.size[0]
+        grid_top = max(0, int(min(row.y for row in time_rows) / 2 - 30))
+        step = self._average_row_step(time_rows)
+        grid_bottom = min(base_image.size[1], int((max(row.y for row in time_rows) + step * 6) / 2 + 50))
+        boxes = self._detect_event_boxes(base_image, grid_bounds=(grid_left, grid_top, grid_right, grid_bottom))
+        if not boxes:
+            return meetings
+        columns = self._cluster_box_columns(boxes, image_width=base_image.size[0])
+        if not columns:
+            return meetings
+        date_keys = sorted({m.meeting_start.strftime('%Y-%m-%d') for m in meetings})
+        if not date_keys:
+            return meetings
+        date_to_col = {date_keys[i]: columns[i] for i in range(min(len(date_keys), len(columns)))}
+        calibrated: list[ImportedMeeting] = []
+        for date_key in date_keys:
+            group = sorted([m for m in meetings if m.meeting_start.strftime('%Y-%m-%d') == date_key], key=lambda m: (m.meeting_start, m.title.lower()))
+            col = date_to_col.get(date_key)
+            if col is None:
+                calibrated.extend(group)
+                continue
+            candidate_boxes = []
+            for box in boxes:
+                if col[0] <= box.cx <= col[1]:
+                    title, quality = self._extract_title_for_box(words, box)
+                    if self._is_cancelled_title(title):
+                        continue
+                    candidate_boxes.append((box, title, quality))
+            candidate_boxes.sort(key=lambda item: item[0].top)
+            used: set[int] = set()
+            for meeting in group:
+                best_idx = None
+                best_score = -1.0
+                mtokens = set(re.findall(r'[a-z0-9]+', meeting.title.lower()))
+                for idx, (box, title, quality) in enumerate(candidate_boxes):
+                    if idx in used:
+                        continue
+                    btokens = set(re.findall(r'[a-z0-9]+', title.lower()))
+                    overlap = len(mtokens & btokens)
+                    order_bias = max(0.0, 1.0 - abs(idx - len(used)) * 0.15)
+                    score = overlap * 2.0 + quality + order_bias
+                    if score > best_score:
+                        best_score = score
+                        best_idx = idx
+                if best_idx is None:
+                    calibrated.append(meeting)
+                    continue
+                used.add(best_idx)
+                box, _, _ = candidate_boxes[best_idx]
+                day_phrase = meeting.meeting_start.strftime('%d %B %Y')
+                calibrated_dt = self._infer_start_datetime(box, time_rows=time_rows, day_phrase=day_phrase)
+                if calibrated_dt is not None:
+                    meeting = ImportedMeeting(
+                        title=meeting.title,
+                        meeting_start=calibrated_dt.replace(second=0, microsecond=0),
+                        reminder_at=(calibrated_dt - timedelta(minutes=self.lead_minutes)).replace(second=0, microsecond=0),
+                        reminder_time_phrase=(calibrated_dt - timedelta(minutes=self.lead_minutes)).strftime('%d %b %Y %I:%M %p'),
+                        source_line=meeting.source_line,
+                        confidence=max(meeting.confidence, 0.84),
+                        confidence_tier=meeting.confidence_tier,
+                        cancelled=meeting.cancelled,
+                    )
+                calibrated.append(meeting)
+        return calibrated
+
+    def _cluster_box_columns(self, boxes: list[EventBox], *, image_width: int) -> list[tuple[float, float, float]]:
+        if not boxes:
+            return []
+        boxes = sorted(boxes, key=lambda b: b.cx)
+        gap_threshold = max(110.0, image_width * 0.14)
+        groups: list[list[EventBox]] = [[boxes[0]]]
+        for box in boxes[1:]:
+            current = groups[-1]
+            avg = sum(b.cx for b in current) / len(current)
+            if abs(box.cx - avg) <= gap_threshold:
+                current.append(box)
+            else:
+                groups.append([box])
+        clusters = []
+        for group in groups:
+            left = min(b.left for b in group) - 20
+            right = max(b.right for b in group) + 20
+            center = sum(b.cx for b in group) / len(group)
+            clusters.append((left, right, center))
+        clusters.sort(key=lambda item: item[2])
+        return clusters
+
     def _load_image(self, image_path: str | Path) -> Image.Image:
         try:
             return Image.open(image_path).convert("RGB")
@@ -436,11 +538,14 @@ class CalendarScreenshotImporter:
         if len(time_rows) < 2:
             return []
 
+        columns = self._scale_day_columns(columns, from_width=width, to_width=base_image.size[0])
+        time_rows = self._scale_time_rows(time_rows, from_height=height, to_height=base_image.size[1])
+
         grid_left = max(0, int(min(col.x_left for col in columns) - 10))
-        grid_right = min(width, int(max(col.x_right for col in columns) + 10))
+        grid_right = min(base_image.size[0], int(max(col.x_right for col in columns) + 10))
         grid_top = max(0, int(min(row.y for row in time_rows) - 25))
         row_step = self._average_row_step(time_rows)
-        grid_bottom = min(height, int(max(row.y for row in time_rows) + row_step * 5.5))
+        grid_bottom = min(base_image.size[1], int(max(row.y for row in time_rows) + row_step * 5.5))
 
         boxes = self._detect_event_boxes(base_image, grid_bounds=(grid_left, grid_top, grid_right, grid_bottom))
         if not boxes:
@@ -507,6 +612,27 @@ class CalendarScreenshotImporter:
                 )
             )
         return words
+
+    def _scale_time_rows(self, rows: list[TimeRow], *, from_height: int, to_height: int) -> list[TimeRow]:
+        if from_height <= 0 or to_height <= 0 or from_height == to_height:
+            return rows
+        scale = to_height / from_height
+        return [TimeRow(phrase=row.phrase, hour_24=row.hour_24, y=row.y * scale) for row in rows]
+
+    def _scale_day_columns(self, columns: list[DayColumn], *, from_width: int, to_width: int) -> list[DayColumn]:
+        if from_width <= 0 or to_width <= 0 or from_width == to_width:
+            return columns
+        scale = to_width / from_width
+        return [
+            DayColumn(
+                label=col.label,
+                day_phrase=col.day_phrase,
+                x_left=col.x_left * scale,
+                x_right=col.x_right * scale,
+                x_center=col.x_center * scale,
+            )
+            for col in columns
+        ]
 
     def _infer_month_year(self, words: list[OcrWord], raw_text: str) -> tuple[str | None, int | None]:
         combined = " ".join(word.text for word in words) + " " + raw_text
@@ -721,9 +847,10 @@ class CalendarScreenshotImporter:
         return min(columns, key=lambda col: abs(col.x_center - box.cx), default=None)
 
     def _infer_start_datetime(self, box: EventBox, *, time_rows: list[TimeRow], day_phrase: str) -> datetime | None:
-        if len(time_rows) < 2:
+        if len(time_rows) < 1:
             return None
         time_rows = sorted(time_rows, key=lambda r: r.y)
+        row_step = self._average_row_step(time_rows)
         start_anchor = None
         next_anchor = None
         for idx in range(len(time_rows) - 1):
@@ -736,23 +863,29 @@ class CalendarScreenshotImporter:
         if start_anchor is None:
             nearest_idx = min(range(len(time_rows)), key=lambda i: abs(time_rows[i].y - box.top))
             start_anchor = time_rows[nearest_idx]
-            next_anchor = time_rows[min(nearest_idx + 1, len(time_rows) - 1)] if nearest_idx + 1 < len(time_rows) else None
+            if nearest_idx + 1 < len(time_rows):
+                next_anchor = time_rows[nearest_idx + 1]
+        if start_anchor is None:
+            return None
+        if next_anchor is None:
+            next_anchor = TimeRow(phrase='', hour_24=min(23, start_anchor.hour_24 + 1), y=start_anchor.y + row_step)
 
+        interval = max(1.0, next_anchor.y - start_anchor.y)
+        # Base the decision on the top edge of the meeting block. A block starting in the lower half
+        # of the hour band usually means a :30 start in Teams day/week views.
+        ratio = max(0.0, min(1.4, (box.top - start_anchor.y) / interval))
         minutes = 0
-        if next_anchor is not None and next_anchor.y > start_anchor.y:
-            interval = max(1.0, next_anchor.y - start_anchor.y)
-            # Estimate the start edge more robustly. On Teams screenshots the hour labels often align
-            # a little above the visible block grid, so relying on the raw top edge oversnaps to full hours.
-            estimated_start_y = box.top + min(box.height * 0.28, interval * 0.22)
-            ratio = max(0.0, min(1.2, (estimated_start_y - start_anchor.y) / interval))
-            # Prefer half-hour starts when the block begins meaningfully below the hour anchor but not near the next one.
-            if ratio >= 0.84:
-                start_anchor = next_anchor
-                minutes = 0
-            elif ratio >= 0.22:
+        if 0.30 <= ratio < 0.93:
+            minutes = 30
+        elif ratio >= 0.93:
+            start_anchor = next_anchor
+            minutes = 0
+        else:
+            # Secondary fallback: if the box centre sits deep into the band, prefer :30.
+            center_ratio = max(0.0, min(1.4, (box.cy - start_anchor.y) / interval))
+            if 0.55 <= center_ratio < 1.05:
                 minutes = 30
-            elif box.height <= interval * 0.72 and (box.cy - start_anchor.y) / interval >= 0.42:
-                minutes = 30
+
         phrase = f"{day_phrase} {self._format_hour(start_anchor.hour_24, minutes)}"
         dt = dateparser.parse(
             phrase,
@@ -764,7 +897,6 @@ class CalendarScreenshotImporter:
             },
         )
         return dt
-
     def _format_hour(self, hour_24: int, minutes: int) -> str:
         base = datetime(2000, 1, 1, hour_24, 0) + timedelta(minutes=minutes)
         return base.strftime("%I:%M %p").lstrip("0")
