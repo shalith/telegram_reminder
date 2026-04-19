@@ -82,12 +82,18 @@ class LLMConversationRouter:
             raw = response.choices[0].message.content or '{}'
             payload = json.loads(raw)
             parsed = RoutePayload.model_validate(payload)
-            return ConversationRouteDecision(
+            llm_decision = ConversationRouteDecision(
                 route=parsed.route,
                 confidence=parsed.confidence,
                 should_use_existing_thread=parsed.should_use_existing_thread,
                 reason=parsed.reason,
             )
+            # Prefer the deterministic reminder path when the message clearly looks operational.
+            if fallback.route != 'general_chat' and llm_decision.route == 'general_chat':
+                return fallback
+            if has_pending_confirmation and fallback.route == 'confirmation_reply' and llm_decision.route != 'confirmation_reply':
+                return fallback
+            return llm_decision
         except Exception:
             return fallback
 

@@ -261,7 +261,7 @@ class CalendarScreenshotImporter:
             "title, date_phrase, start_time, cancelled, confidence_tier. "
             "Use visible calendar structure: month/year header, day columns, left time axis, and blue meeting blocks. "
             "Ignore navigation/search UI and do not invent meetings. "
-            "Prefer approximate but sensible start times from the visible grid, especially half-hour starts such as 8:30 AM or 9:30 AM when blocks begin midway between hour lines. "
+            "Prefer approximate but sensible start times from the visible grid, especially half-hour starts such as 8:30 AM or 9:30 AM when blocks begin midway between hour lines. Do not round to the nearest hour if a block clearly starts around the half-hour. "
             "If a title is partly visible, return the readable portion. If a meeting is marked canceled/cancelled/annulé, set cancelled=true. Also return confidence_tier as either high or likely. "
             "If uncertain, return fewer meetings, not more."
         )
@@ -359,7 +359,7 @@ class CalendarScreenshotImporter:
         gray = ImageOps.grayscale(image)
         gray = ImageOps.autocontrast(gray)
         gray = ImageEnhance.Contrast(gray).enhance(2.1)
-        gray = ImageFilter.UnsharpMask(radius=1.4, percent=180, threshold=2).filter(gray)
+        gray = gray.filter(ImageFilter.UnsharpMask(radius=1.4, percent=180, threshold=2))
         return gray
 
     def _ocr_text(self, image: Image.Image) -> str:
@@ -734,7 +734,6 @@ class CalendarScreenshotImporter:
                 next_anchor = nxt
                 break
         if start_anchor is None:
-            # fall back to nearest row by top edge, not center, which over-snaps to full hours
             nearest_idx = min(range(len(time_rows)), key=lambda i: abs(time_rows[i].y - box.top))
             start_anchor = time_rows[nearest_idx]
             next_anchor = time_rows[min(nearest_idx + 1, len(time_rows) - 1)] if nearest_idx + 1 < len(time_rows) else None
@@ -742,12 +741,17 @@ class CalendarScreenshotImporter:
         minutes = 0
         if next_anchor is not None and next_anchor.y > start_anchor.y:
             interval = max(1.0, next_anchor.y - start_anchor.y)
-            ratio = max(0.0, min(1.2, (box.top - start_anchor.y) / interval))
-            if ratio >= 0.75:
-                # very close to next hour line
+            # Estimate the start edge more robustly. On Teams screenshots the hour labels often align
+            # a little above the visible block grid, so relying on the raw top edge oversnaps to full hours.
+            estimated_start_y = box.top + min(box.height * 0.28, interval * 0.22)
+            ratio = max(0.0, min(1.2, (estimated_start_y - start_anchor.y) / interval))
+            # Prefer half-hour starts when the block begins meaningfully below the hour anchor but not near the next one.
+            if ratio >= 0.84:
                 start_anchor = next_anchor
                 minutes = 0
-            elif ratio >= 0.38:
+            elif ratio >= 0.22:
+                minutes = 30
+            elif box.height <= interval * 0.72 and (box.cy - start_anchor.y) / interval >= 0.42:
                 minutes = 30
         phrase = f"{day_phrase} {self._format_hour(start_anchor.hour_24, minutes)}"
         dt = dateparser.parse(

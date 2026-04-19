@@ -121,7 +121,7 @@ class InterpretationService:
         )
 
     def _looks_like_new_request(self, message_text: str) -> bool:
-        lowered = (message_text or '').strip().lower()
+        lowered = ' '.join((message_text or '').strip().lower().split())
         prefixes = (
             'remind me',
             'wake me up',
@@ -148,7 +148,11 @@ class InterpretationService:
             'send my daily agenda',
             'set my ',
         )
-        return lowered.startswith(prefixes)
+        if lowered.startswith(prefixes):
+            return True
+        time_tokens = ('today', 'tomorrow', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'morning', 'afternoon', 'evening', 'night', 'am', 'pm')
+        action_tokens = ('remind', 'wake', 'schedule', 'list', 'update', 'delete', 'cancel', 'remove')
+        return any(tok in lowered for tok in time_tokens) and any(tok in lowered for tok in action_tokens)
 
     def _extract_wake_time_phrase(self, message_text: str) -> str | None:
         normalized = ' '.join((message_text or '').strip().split())
